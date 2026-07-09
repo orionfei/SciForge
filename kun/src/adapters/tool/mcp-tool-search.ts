@@ -292,6 +292,17 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         } catch (error) {
           const validation = mcpInputValidationFailure(error)
           if (validation) return { output: validation, isError: true }
+          if (isResearchSearchMcpTool(record.descriptor.name)) {
+            return {
+              output: {
+                serverId: record.serverId,
+                toolName: record.descriptor.name,
+                toolId: record.toolId,
+                result: researchSearchUnavailableMcpResult(error)
+              },
+              isError: false
+            }
+          }
           throw error
         }
         return {
@@ -601,6 +612,28 @@ function objectArg(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
+}
+
+function researchSearchUnavailableMcpResult(error: unknown): Record<string, unknown> {
+  return {
+    content: [{
+      type: 'text',
+      text: researchSearchUnavailableMessage(error)
+    }]
+  }
+}
+
+function researchSearchUnavailableMessage(error: unknown): string {
+  return [
+    'research_search is unavailable for this turn.',
+    `Failure: ${error instanceof Error ? error.message : String(error)}`,
+    'Do not call research_search again in this turn.',
+    'Answer from the context you already have, or use a different available tool if one is clearly relevant.'
+  ].join(' ')
+}
+
+function isResearchSearchMcpTool(name: string): boolean {
+  return name === 'research_search' || name.endsWith('_research_search')
 }
 
 function clampPositiveInt(value: number | undefined, fallback: number, max: number): number {

@@ -9,14 +9,14 @@ import { errorMessage, fetchJson } from '../http.js';
 const TAVILY_SEARCH_URL = 'https://api.tavily.com/search';
 
 export class TavilyResearchProvider implements ResearchSearchProvider {
-  readonly id: 'tavily' | 'cns';
+  readonly id: 'tavily' | 'biorxiv_web' | 'cns';
 
   constructor(
     private readonly apiKey: string,
     private readonly options: {
-      id?: 'tavily' | 'cns';
+      id?: 'tavily' | 'biorxiv_web' | 'cns';
       includeDomains?: string[];
-      resultSource?: 'tavily' | 'cns';
+      resultSource?: 'tavily' | 'biorxiv_web' | 'cns';
     } = {}
   ) {
     this.id = options.id ?? 'tavily';
@@ -52,7 +52,11 @@ export class TavilyResearchProvider implements ResearchSearchProvider {
           ...(this.options.includeDomains?.length ? { include_domains: this.options.includeDomains } : {})
         })
       });
-      const webResults = parseTavilyResults(json, this.options.resultSource ?? 'tavily');
+      const webResults = parseTavilyResults(
+        json,
+        this.options.resultSource ?? 'tavily',
+        this.options.includeDomains
+      );
       return {
         papers: [],
         webResults,
@@ -78,7 +82,11 @@ export class TavilyResearchProvider implements ResearchSearchProvider {
   }
 }
 
-function parseTavilyResults(value: unknown, source: 'tavily' | 'cns'): ResearchWebResult[] {
+function parseTavilyResults(
+  value: unknown,
+  source: 'tavily' | 'biorxiv_web' | 'cns',
+  includeDomains: string[] | undefined
+): ResearchWebResult[] {
   const results = asRecord(value).results;
   if (!Array.isArray(results)) return [];
   return results.map((item, index) => {
@@ -86,6 +94,7 @@ function parseTavilyResults(value: unknown, source: 'tavily' | 'cns'): ResearchW
     const title = stringValue(record.title) || stringValue(record.url);
     const url = stringValue(record.url);
     if (!title || !url) return null;
+    if (includeDomains?.length && !urlMatchesDomain(url, includeDomains)) return null;
     return {
       title,
       url,
@@ -94,6 +103,18 @@ function parseTavilyResults(value: unknown, source: 'tavily' | 'cns'): ResearchW
       rank: index + 1
     };
   }).filter((item): item is ResearchWebResult => item !== null);
+}
+
+function urlMatchesDomain(value: string, domains: string[]): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase().replace(/^www\./, '');
+    return domains.some((domain) => {
+      const normalized = domain.toLowerCase().replace(/^www\./, '');
+      return hostname === normalized || hostname.endsWith(`.${normalized}`);
+    });
+  } catch {
+    return false;
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

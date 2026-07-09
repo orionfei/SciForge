@@ -113,6 +113,7 @@ type ServerState = {
   clientPromise?: Promise<CodexDynamicMcpClient>
   catalog?: CatalogTool[]
   catalogPromise?: Promise<CatalogTool[]>
+  suppressedToolNames: Set<string>
   activeRequests: Set<ActiveMcpRequest>
   trackedComputerUseSessionIds: Set<string>
   lifecycleEvents: CodexDynamicMcpLifecycleEvent[]
@@ -146,6 +147,7 @@ export class CodexDynamicMcpToolBridge {
             timeoutMs: server.timeoutMs ?? DEFAULT_TIMEOUT_MS
           },
           namespace,
+          suppressedToolNames: new Set<string>(),
           activeRequests: new Set<ActiveMcpRequest>(),
           trackedComputerUseSessionIds: new Set<string>(),
           lifecycleEvents: []
@@ -204,6 +206,9 @@ export class CodexDynamicMcpToolBridge {
         resolved = await this.resolveTool(request)
         if (!resolved) {
           const name = request.namespace ? `${request.namespace}.${request.tool}` : request.tool
+          if (isResearchSearchRequestName(name)) {
+            return researchSearchUnavailableDynamicToolResponse(new Error('research_search is unavailable for this turn.'))
+          }
           return failedDynamicToolResponse(`No configured MCP dynamic tool matched ${name}.`)
         }
         return await this.invokeResolvedTool(resolved, request, options)
@@ -214,7 +219,15 @@ export class CodexDynamicMcpToolBridge {
           resolved = null
           continue
         }
-        const name = resolved?.tool.originalName ?? (request.namespace ? `${request.namespace}.${request.tool}` : request.tool)
+        const tool = resolved?.tool
+        if (resolved && tool && isResearchSearchTool(tool.originalName)) {
+          this.suppressTool(resolved.state, tool)
+          return researchSearchUnavailableDynamicToolResponse(error)
+        }
+        if (!tool && isResearchSearchRequest(request)) {
+          return researchSearchUnavailableDynamicToolResponse(error)
+        }
+        const name = tool?.originalName ?? (request.namespace ? `${request.namespace}.${request.tool}` : request.tool)
         return failedDynamicToolResponse(
           `MCP tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`
         )
@@ -301,7 +314,12 @@ export class CodexDynamicMcpToolBridge {
         { signal, timeout: state.config.timeoutMs }
       )
     )
-    return dynamicToolResponseFromMcpResult(result)
+    const response = dynamicToolResponseFromMcpResult(result)
+    if (isResearchSearchTool(tool.originalName) && !response.success) {
+      this.suppressTool(state, tool)
+      return researchSearchUnavailableDynamicToolResponse(result)
+    }
+    return response
   }
 
   private async availableCatalogEntries(): Promise<Array<{ state: ServerState; tool: CatalogTool }>> {
@@ -314,7 +332,9 @@ export class CodexDynamicMcpToolBridge {
       }
     }))
     return listed.flatMap((entry) => entry
-      ? entry.catalog.map((tool) => ({ state: entry.state, tool }))
+      ? entry.catalog
+        .filter((tool) => !entry.state.suppressedToolNames.has(tool.originalName))
+        .map((tool) => ({ state: entry.state, tool }))
       : [])
   }
 
@@ -362,11 +382,17 @@ export class CodexDynamicMcpToolBridge {
     return tools
       .filter((tool) => !enabled.size || enabled.has(tool.name))
       .filter((tool) => tool.name.trim().length > 0)
+      .filter((tool) => !state.suppressedToolNames.has(tool.name))
       .map((tool) => ({
         ...tool,
         originalName: tool.name,
         dynamicName: uniqueDynamicName(slug(tool.name), tool.name, usedNames, 128)
       }))
+  }
+
+  private suppressTool(state: ServerState, tool: CatalogTool): void {
+    state.suppressedToolNames.add(tool.originalName)
+    state.catalog = state.catalog?.filter((candidate) => candidate.originalName !== tool.originalName)
   }
 
   private async clientFor(state: ServerState): Promise<CodexDynamicMcpClient> {
@@ -587,6 +613,61 @@ function failedDynamicToolResponse(message: string): CodexAppServerDynamicToolCa
     contentItems: [{ type: 'inputText', text: message }],
     success: false
   }
+}
+
+function researchSearchUnavailableDynamicToolResponse(error: unknown): CodexAppServerDynamicToolCallResponse {
+  return {
+    contentItems: [{
+      type: 'inputText',
+      text: researchSearchUnavailableMessage(error)
+    }],
+    success: true
+  }
+}
+
+function researchSearchUnavailableMessage(error: unknown): string {
+  return [
+    'research_search is unavailable for this turn.',
+    `Failure: ${researchSearchFailureSummary(error)}`,
+    'Do not call research_search again in this turn.',
+    'Answer from the context you already have, or use a different available tool if one is clearly relevant.'
+  ].join(' ')
+}
+
+function researchSearchFailureSummary(error: unknown): string {
+  const message = errorMessageForTool(error).replace(/\s+/g, ' ').trim()
+  if (!message) return 'search service unavailable.'
+  if (/stderr:|Cannot find module|MCP error -32000: Connection closed|Transport closed|Connection closed/i.test(message)) {
+    return 'search service unavailable.'
+  }
+  return message.length > 240 ? `${message.slice(0, 240)}...` : message
+}
+
+function errorMessageForTool(error: unknown): string {
+  if (error instanceof Error) return error.message
+  const record = asRecord(error)
+  if (record) {
+    const content = arrayValue(record.content)
+      .map((item) => stringValue(asRecord(item)?.text))
+      .filter(Boolean)
+      .join(' ')
+    if (content) return content
+  }
+  return String(error)
+}
+
+function isResearchSearchTool(name: string): boolean {
+  return name === 'research_search' || name.endsWith('_research_search')
+}
+
+function isResearchSearchRequest(request: CodexAppServerDynamicToolCallRequest): boolean {
+  const name = request.namespace ? `${request.namespace}.${request.tool}` : request.tool
+  return isResearchSearchRequestName(name)
+}
+
+function isResearchSearchRequestName(name: string): boolean {
+  const normalized = name.split('.').at(-1) ?? name
+  return normalized === 'research_search' || normalized.endsWith('_research_search')
 }
 
 function recordArguments(value: unknown): Record<string, unknown> {

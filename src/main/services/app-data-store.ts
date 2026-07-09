@@ -24,6 +24,7 @@ export type AppDataJsonlStoreOptions = {
 }
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0
+const ATOMIC_RENAME_RETRY_DELAYS_MS = [20, 50, 100, 200, 400] as const
 
 export class AppDataJsonlStore {
   private readonly rootDir: string
@@ -182,12 +183,34 @@ async function atomicWriteResolvedAppDataText(
     })
     await assertSafeExistingDirectory(target.rootPath, target.parentPath)
     await assertSafeExistingFile(target.rootPath, target.path)
-    await rename(tmpPath, target.path)
+    await renameWithTransientRetry(tmpPath, target.path)
     await assertSafeExistingFile(target.rootPath, target.path)
   } catch (error) {
     await rm(tmpPath, { force: true }).catch(() => undefined)
     throw error
   }
+}
+
+async function renameWithTransientRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      const delayMs = ATOMIC_RENAME_RETRY_DELAYS_MS[attempt]
+      if (delayMs === undefined || !isTransientRenameError(error)) throw error
+      await delay(delayMs)
+    }
+  }
+}
+
+function isTransientRenameError(error: unknown): boolean {
+  if (!isErrno(error)) return false
+  return error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EBUSY'
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function appendResolvedAppDataText(

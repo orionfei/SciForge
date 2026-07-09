@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AgentLoop } from './agent-loop.js'
+import {
+  AgentLoop,
+  delegatedResearchToolUseInstruction,
+  shouldRecoverDelegatedResearchNoTool
+} from './agent-loop.js'
 
 type DispatchOutcome =
   | { kind: 'aborted' }
@@ -30,6 +34,68 @@ describe('AgentLoop tool-loop recovery state', () => {
     await expect(handle({ kind: 'all_suppressed', suppressedCount: 1 }, 2)).resolves.toBe('failed')
 
     expect(turns.applyItem).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('delegatedResearchToolUseInstruction', () => {
+  it('instructs the parent to delegate research tasks when delegate tools are available', () => {
+    const instruction = delegatedResearchToolUseInstruction([{
+      name: 'delegate_task',
+      description: 'Run a child task',
+      inputSchema: { type: 'object' }
+    }])
+
+    expect(instruction).toContain('use `delegate_tasks` before writing the final answer')
+    expect(instruction).toContain('3-5 parallel child tasks')
+    expect(instruction).toContain('调研')
+  })
+
+  it('does not emit guidance when delegation tools are unavailable', () => {
+    expect(delegatedResearchToolUseInstruction([{
+      name: 'read',
+      description: 'Read a file',
+      inputSchema: { type: 'object' }
+    }])).toBeUndefined()
+  })
+})
+
+describe('shouldRecoverDelegatedResearchNoTool', () => {
+  const delegateTools = [{
+    name: 'delegate_tasks',
+    description: 'Run child tasks',
+    inputSchema: { type: 'object' }
+  }]
+
+  it('requires recovery when a research request stops without delegation', () => {
+    expect(shouldRecoverDelegatedResearchNoTool({
+      tools: delegateTools,
+      latestUserText: '帮我调研一下现在社区里面agentic RL大家选择GRPO还是GSPO？',
+      items: [],
+      turnId: 'turn-1'
+    })).toBe(true)
+  })
+
+  it('allows final synthesis after a successful delegation result', () => {
+    expect(shouldRecoverDelegatedResearchNoTool({
+      tools: delegateTools,
+      latestUserText: '帮我调研一下现在社区里面agentic RL大家选择GRPO还是GSPO？',
+      items: [{
+        id: 'result-1',
+        turnId: 'turn-1',
+        threadId: 'thread-1',
+        role: 'tool',
+        status: 'completed',
+        createdAt: '2026-07-08T00:00:00.000Z',
+        finishedAt: '2026-07-08T00:00:00.000Z',
+        kind: 'tool_result',
+        callId: 'call-1',
+        toolName: 'delegate_tasks',
+        toolKind: 'tool_call',
+        output: { status: 'completed' },
+        isError: false
+      }],
+      turnId: 'turn-1'
+    })).toBe(false)
   })
 })
 

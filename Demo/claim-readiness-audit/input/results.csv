@@ -1,0 +1,7 @@
+method,seed,split,accuracy,macro_f1,auroc,preprocessing,notes
+Baseline-A,11,test,0.842,0.611,0.901,standard_v1,reported baseline re-run
+Baseline-A,22,test,0.848,0.617,0.905,standard_v1,reported baseline re-run
+Baseline-A,33,test,0.839,0.608,0.899,standard_v1,reported baseline re-run
+SciForgeNet,11,test,0.861,0.623,0.913,augmented_v2,main method
+SciForgeNet,22,test,0.868,0.629,0.918,augmented_v2,main method
+SciForgeNet,33,test,0.858,0.620,0.911,augmented_v2,main method

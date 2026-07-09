@@ -1,6 +1,7 @@
 import { EMPTY_MULTI_AGENT_USAGE, MultiAgentRuntimeError, type MultiAgentRuntime } from '@sciforge/multi-agent'
 import type { CapabilityToolProvider } from './capability-registry.js'
 import { LocalToolHost } from './local-tool-host.js'
+import type { ToolHostContext } from '../../ports/tool-host.js'
 
 const DEFAULT_DELEGATE_TIMEOUT_MS = 600_000
 const MAX_DELEGATE_TIMEOUT_MS = 1_200_000
@@ -38,7 +39,7 @@ export function buildDelegationToolProviders(runtime: MultiAgentRuntime | undefi
     tools: [
       LocalToolHost.defineTool({
         name: 'delegate_task',
-        description: 'Run a bounded child agent task and return its summary.',
+        description: 'Run one bounded child agent task and return its summary. For broad research/survey/literature tasks, prefer delegate_tasks so multiple focused child agents can run in parallel.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -60,6 +61,17 @@ export function buildDelegationToolProviders(runtime: MultiAgentRuntime | undefi
           const task = {
             prompt,
             ...(typeof args.label === 'string' ? { label: args.label } : {})
+          }
+          if (isBroadResearchDelegationPrompt(prompt)) {
+            return runDelegateTasksBatch({
+              runtime,
+              context,
+              tasks: researchFanoutTasks(prompt),
+              sharedWorkspace: typeof args.workspace === 'string' ? args.workspace.trim() : '',
+              sharedModel: normalizeDelegateModel(args.model),
+              sharedTimeoutMs: timeoutMs,
+              fanoutReason: 'Broad research prompt auto-split into focused parallel child tasks. Use delegate_tasks directly for this workflow.'
+            })
           }
           const childToolPolicy = childToolPolicyForPrompt(
             prompt,
@@ -108,7 +120,7 @@ export function buildDelegationToolProviders(runtime: MultiAgentRuntime | undefi
       }),
       LocalToolHost.defineTool({
         name: 'delegate_tasks',
-        description: 'Run a batch of bounded child agent tasks concurrently up to the configured subagent parallel budget and return their summaries.',
+        description: 'Run a batch of bounded child agent tasks concurrently up to the configured subagent parallel budget and return their summaries. Use this by default for research/survey/literature/community-adoption tasks: split into 3-5 evidence-isolated directions such as exact terminology, scholarly papers/citations, code ecosystem adoption, and community discussion.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -144,79 +156,14 @@ export function buildDelegationToolProviders(runtime: MultiAgentRuntime | undefi
             .filter((task): task is NormalizedDelegateTask => task != null)
           if (tasks.length === 0) return { output: { error: 'at least one task with a prompt is required' }, isError: true }
 
-          const diagnostics = await runtime.diagnostics(context.threadId)
-          const availableParallel = Math.max(1, diagnostics.config.maxParallel - diagnostics.active)
-          const concurrency = Math.min(tasks.length, availableParallel)
-          const firstSpawnIndex = diagnostics.childRuns.length + 1
-          const sharedWorkspace = typeof args.workspace === 'string' ? args.workspace.trim() : ''
-          const sharedModel = normalizeDelegateModel(args.model)
-          const sharedTimeoutMs = normalizeDelegateTimeoutMs(args.timeout_ms, DEFAULT_DELEGATE_TIMEOUT_MS)
-          const records = await runWithConcurrency(tasks, concurrency, async (task, index) => {
-            const timeoutMs = task.timeoutMs ?? sharedTimeoutMs
-            const childToolPolicy = childToolPolicyForPrompt(
-              task.prompt,
-              context.explicitAllowedToolNames,
-              context.explicitStrictAllowedToolNames === true
-            )
-            try {
-              return await runDelegateChildWithWatchdog({
-                parentSignal: context.abortSignal,
-                timeoutMs,
-                run: (signal) => retryWhileParallelBudgetExhausted(signal, () => runtime.runChild({
-                  parentThreadId: context.threadId,
-                  parentTurnId: context.turnId,
-                  label: task.label,
-                  prompt: withChildRuntimeGuardrails(task.prompt),
-                  workspace: (task.workspace ?? sharedWorkspace) || context.workspace,
-                  model: task.model ?? sharedModel ?? context.model?.id,
-                  childTimeoutMs: timeoutMs,
-                  ...(childToolPolicy.allowedToolNames ? { allowedToolNames: childToolPolicy.allowedToolNames } : {}),
-                  strictAllowedToolNames: childToolPolicy.strictAllowedToolNames,
-                  ...(childToolPolicy.maxToolCalls !== undefined ? { maxToolCalls: childToolPolicy.maxToolCalls } : {}),
-                  ...(context.bashCommandPolicy ? { bashCommandPolicy: context.bashCommandPolicy } : {}),
-                  ...(context.filePathPolicy ? { filePathPolicy: context.filePathPolicy } : {}),
-                  signal
-                }))
-              })
-            } catch (error) {
-              return failedDelegateRecord(task, index, error, context.threadId, context.turnId)
-            }
+          return runDelegateTasksBatch({
+            runtime,
+            context,
+            tasks,
+            sharedWorkspace: typeof args.workspace === 'string' ? args.workspace.trim() : '',
+            sharedModel: normalizeDelegateModel(args.model),
+            sharedTimeoutMs: normalizeDelegateTimeoutMs(args.timeout_ms, DEFAULT_DELEGATE_TIMEOUT_MS)
           })
-          const children = records.map((record, index) => ({
-            childId: record.id,
-            label: record.label,
-            status: record.status,
-            summary: record.summary,
-            error: record.error,
-            usage: record.usage,
-            effective_timeout_ms: tasks[index]?.timeoutMs ?? sharedTimeoutMs
-          }))
-          const completed = children.filter((child) => child.status === 'completed').length
-          const failed = children.filter((child) => child.status === 'failed').length
-          const aborted = children.filter((child) => child.status === 'aborted').length
-          const terminal = completed + failed + aborted
-          const batchStatus = completed === children.length
-            ? 'completed'
-            : terminal === children.length && completed > 0
-              ? 'partial'
-              : 'failed'
-          return {
-            output: {
-              children,
-              total: children.length,
-              status: batchStatus,
-              completed,
-              failed,
-              aborted,
-              concurrency,
-              configured_concurrency: diagnostics.config.maxParallel,
-              effective_timeout_ms: sharedTimeoutMs,
-              ...(firstSpawnIndex > 1
-                ? { warning: `This batch starts at child agent spawn #${firstSpawnIndex} for the thread. Spawn only when the extra prefix/cache cost is worth it.` }
-                : {})
-            },
-            isError: batchStatus === 'failed'
-          }
         }
       })
     ]
@@ -274,6 +221,89 @@ function normalizeDelegateTimeoutMs(value: unknown, defaultMs?: number): number 
 }
 
 type DelegateRecordLike = Awaited<ReturnType<MultiAgentRuntime['runChild']>>
+
+async function runDelegateTasksBatch(input: {
+  runtime: MultiAgentRuntime
+  context: ToolHostContext
+  tasks: NormalizedDelegateTask[]
+  sharedWorkspace?: string
+  sharedModel?: string
+  sharedTimeoutMs?: number
+  fanoutReason?: string
+}): Promise<{ output: unknown; isError?: boolean }> {
+  const diagnostics = await input.runtime.diagnostics(input.context.threadId)
+  const availableParallel = Math.max(1, diagnostics.config.maxParallel - diagnostics.active)
+  const concurrency = Math.min(input.tasks.length, availableParallel)
+  const firstSpawnIndex = diagnostics.childRuns.length + 1
+  const sharedTimeoutMs = input.sharedTimeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS
+  const records = await runWithConcurrency(input.tasks, concurrency, async (task, index) => {
+    const timeoutMs = task.timeoutMs ?? sharedTimeoutMs
+    const childToolPolicy = childToolPolicyForPrompt(
+      task.prompt,
+      input.context.explicitAllowedToolNames,
+      input.context.explicitStrictAllowedToolNames === true
+    )
+    try {
+      return await runDelegateChildWithWatchdog({
+        parentSignal: input.context.abortSignal,
+        timeoutMs,
+        run: (signal) => retryWhileParallelBudgetExhausted(signal, () => input.runtime.runChild({
+          parentThreadId: input.context.threadId,
+          parentTurnId: input.context.turnId,
+          label: task.label,
+          prompt: withChildRuntimeGuardrails(task.prompt),
+          workspace: (task.workspace ?? input.sharedWorkspace) || input.context.workspace,
+          model: task.model ?? input.sharedModel ?? input.context.model?.id,
+          childTimeoutMs: timeoutMs,
+          ...(childToolPolicy.allowedToolNames ? { allowedToolNames: childToolPolicy.allowedToolNames } : {}),
+          strictAllowedToolNames: childToolPolicy.strictAllowedToolNames,
+          ...(childToolPolicy.maxToolCalls !== undefined ? { maxToolCalls: childToolPolicy.maxToolCalls } : {}),
+          ...(input.context.bashCommandPolicy ? { bashCommandPolicy: input.context.bashCommandPolicy } : {}),
+          ...(input.context.filePathPolicy ? { filePathPolicy: input.context.filePathPolicy } : {}),
+          signal
+        }))
+      })
+    } catch (error) {
+      return failedDelegateRecord(task, index, error, input.context.threadId, input.context.turnId)
+    }
+  })
+  const children = records.map((record, index) => ({
+    childId: record.id,
+    label: record.label,
+    status: record.status,
+    summary: record.summary,
+    error: record.error,
+    usage: record.usage,
+    effective_timeout_ms: input.tasks[index]?.timeoutMs ?? sharedTimeoutMs
+  }))
+  const completed = children.filter((child) => child.status === 'completed').length
+  const failed = children.filter((child) => child.status === 'failed').length
+  const aborted = children.filter((child) => child.status === 'aborted').length
+  const terminal = completed + failed + aborted
+  const batchStatus = completed === children.length
+    ? 'completed'
+    : terminal === children.length && completed > 0
+      ? 'partial'
+      : 'failed'
+  return {
+    output: {
+      children,
+      total: children.length,
+      status: batchStatus,
+      completed,
+      failed,
+      aborted,
+      concurrency,
+      configured_concurrency: diagnostics.config.maxParallel,
+      effective_timeout_ms: sharedTimeoutMs,
+      ...(input.fanoutReason ? { fanout: true, fanout_reason: input.fanoutReason } : {}),
+      ...(firstSpawnIndex > 1
+        ? { warning: `This batch starts at child agent spawn #${firstSpawnIndex} for the thread. Spawn only when the extra prefix/cache cost is worth it.` }
+        : {})
+    },
+    isError: batchStatus === 'failed'
+  }
+}
 
 async function retryWhileParallelBudgetExhausted(
   signal: AbortSignal,
@@ -439,6 +469,47 @@ function isResearchCollectionPrompt(prompt: string): boolean {
     /基准/,
     /定价/
   ].some((pattern) => pattern.test(normalized))
+}
+
+function isBroadResearchDelegationPrompt(prompt: string): boolean {
+  if (!isResearchCollectionPrompt(prompt)) return false
+  const normalized = prompt.toLowerCase()
+  return prompt.length > 220 || [
+    /调研.*(?:社区|趋势|选择|对比|相关工作|综述)/,
+    /(?:社区|趋势|选择|对比|相关工作|综述).*调研/,
+    /请查找以下信息/,
+    /(?:^|\n)\s*\d+[.、]/,
+    /\b(?:survey|literature review|related work|community adoption|trend|comparison|compare|vs\.?)\b/
+  ].some((pattern) => pattern.test(normalized))
+}
+
+function researchFanoutTasks(prompt: string): NormalizedDelegateTask[] {
+  const taskPrefix = [
+    '这是一个并行调研子任务。只完成本方向，不要试图覆盖全部问题。',
+    '优先使用可用的 research/search 工具；返回简洁证据：标题、年份、URL/来源覆盖、关键结论和不确定性。',
+    '不要使用 bash/curl/wget/浏览器自动化，不要输出长篇背景。',
+    '',
+    '原始用户问题：',
+    prompt
+  ].join('\n')
+  return [
+    {
+      label: 'exact-identity-terminology',
+      prompt: `${taskPrefix}\n\n方向：精确身份与术语验证。只负责确认关键缩写/方法名的正确全称、是否存在正式论文、是否有误称或缩写冲突。对 GSPO 必须同时搜索 GSPO、"Group Sequence Policy Optimization"、以及常见错误展开；输出可验证来源和结论，不评估社区采用。`
+    },
+    {
+      label: 'scholarly-paper-citations',
+      prompt: `${taskPrefix}\n\n方向：论文与引用证据。只查 arXiv、Semantic Scholar、OpenAlex/学术索引、会议/技术报告等学术来源，比较 GRPO、GSPO 及相关方法在论文中的出现时间、引用/提及和代表性工作；不要使用 GitHub star 或社媒作为证据。`
+    },
+    {
+      label: 'code-ecosystem-adoption',
+      prompt: `${taskPrefix}\n\n方向：代码生态采用。只查 GitHub、HuggingFace、TRL、verl、OpenRLHF、RLHFFlow、Unsloth、框架文档和实现教程，判断工程社区实际集成/默认支持/使用频率；不要用论文引用作为主要证据。`
+    },
+    {
+      label: 'community-discourse-trends',
+      prompt: `${taskPrefix}\n\n方向：社区讨论与趋势。只查博客、论坛、Reddit/X/LinkedIn 摘要、厂商公告、教程文章和社区问答，提取 2024-2026 年大家讨论 GRPO、GSPO、DAPO、SAPO、RLOO 等路线时的偏好和理由；明确区分传闻、教程和正式证据。`
+    }
+  ]
 }
 
 async function runWithConcurrency<T, R>(

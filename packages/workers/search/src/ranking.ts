@@ -4,6 +4,8 @@ import type {
   ResearchWebResult
 } from './types.js';
 
+const CURRENT_YEAR = 2026;
+
 export type ThemeCluster = {
   name: string;
   papers: string[];
@@ -14,6 +16,12 @@ export function mergeAndRankPapers(input: {
   papers: ResearchPaper[];
   query: string;
   intent: ResearchIntent;
+  relevanceCriteria?: {
+    required: Array<{ name: string; weight: number }>;
+    niceToHave: Array<{ name: string; weight: number }>;
+  };
+  centrality?: 'central' | 'less_cited' | null;
+  recency?: 'recent' | 'early' | null;
   maxResults: number;
 }): ResearchPaper[] {
   const merged = new Map<string, ResearchPaper>();
@@ -23,12 +31,20 @@ export function mergeAndRankPapers(input: {
     const existing = merged.get(key);
     merged.set(key, existing ? mergePaper(existing, paper) : normalizePaper(paper));
   }
-  return [...merged.values()]
+  const titleMerged = new Map<string, ResearchPaper>();
+  for (const paper of merged.values()) {
+    const key = `title:${normalizeTitle(paper.title).toLowerCase().replace(/[^a-z0-9]+/g, '')}`;
+    const existing = titleMerged.get(key);
+    titleMerged.set(key, existing ? mergePaper(existing, paper) : paper);
+  }
+  return [...titleMerged.values()]
     .map((paper) => ({
       ...paper,
       relevanceReason: paper.relevanceReason ?? relevanceReason(paper, input.query)
     }))
-    .sort((a, b) => scorePaper(b, input.query, input.intent) - scorePaper(a, input.query, input.intent))
+    .sort((a, b) =>
+      scorePaper(b, input) - scorePaper(a, input)
+    )
     .slice(0, input.maxResults);
 }
 
@@ -160,20 +176,70 @@ function paperKey(paper: ResearchPaper): string {
   return `title:${normalizeTitle(paper.title).toLowerCase().replace(/[^a-z0-9]+/g, '')}`;
 }
 
-function scorePaper(paper: ResearchPaper, query: string, intent: ResearchIntent): number {
+function scorePaper(
+  paper: ResearchPaper,
+  input: {
+    query: string;
+    intent: ResearchIntent;
+    relevanceCriteria?: {
+      required: Array<{ name: string; weight: number }>;
+      niceToHave: Array<{ name: string; weight: number }>;
+    };
+    centrality?: 'central' | 'less_cited' | null;
+    recency?: 'recent' | 'early' | null;
+  }
+): number {
   const text = textForPaper(paper).toLowerCase();
-  const terms = query.toLowerCase().split(/\W+/).filter((term) => term.length > 2);
+  const terms = meaningfulTerms(input.query);
   const lexical = terms.reduce((score, term) => score + (text.includes(term) ? 3 : 0), 0);
-  const recency = paper.year ? Math.max(0, paper.year - 2019) : 0;
-  const citation = Math.log10((paper.citationCount ?? 0) + 1) * 4;
+  const criteria = criteriaScore(text, input.relevanceCriteria);
+  const recency = paper.year ? Math.min(5, Math.max(0, paper.year - 2020)) : 0;
+  const wantsRecent = input.intent === 'latest' || input.recency === 'recent';
+  const citation = Math.log10((paper.citationCount ?? 0) + 1) * (wantsRecent ? 2 : 4);
   const venue = paper.venue ? 2 : 0;
   const tldr = paper.tldr ? 1 : 0;
-  const intentBoost = intent === 'latest'
-    ? recency * 1.5
-    : intent === 'baseline' || intent === 'sota'
+  const recentIntentBoost = wantsRecent ? freshnessBoost(paper.year) : 0;
+  const intentBoost = wantsRecent
+    ? recency * 0.8 + recentIntentBoost
+    : input.recency === 'early'
+      ? -recency * 0.5
+      : input.intent === 'baseline' || input.intent === 'sota' || input.centrality === 'central'
       ? citation + venue
+      : input.centrality === 'less_cited'
+        ? -citation
       : 0;
-  return lexical + recency + citation + venue + tldr + intentBoost;
+  return lexical + criteria + recency + citation + venue + tldr + intentBoost;
+}
+
+function freshnessBoost(year: number | undefined): number {
+  if (!year) return 0;
+  if (year >= CURRENT_YEAR) return 10;
+  if (year === CURRENT_YEAR - 1) return 7;
+  if (year === CURRENT_YEAR - 2) return 4;
+  if (year === CURRENT_YEAR - 3) return 1;
+  return -3;
+}
+
+function criteriaScore(
+  text: string,
+  criteria: {
+    required: Array<{ name: string; weight: number }>;
+    niceToHave: Array<{ name: string; weight: number }>;
+  } | undefined
+): number {
+  if (!criteria) return 0;
+  const required = criteria.required.reduce((score, criterion) => {
+    const terms = meaningfulTerms(criterion.name);
+    if (terms.length === 0) return score;
+    const hits = terms.filter((term) => text.includes(term)).length;
+    return score + (hits / terms.length) * criterion.weight * 12;
+  }, 0);
+  const nice = criteria.niceToHave.reduce((score, criterion) => {
+    const terms = meaningfulTerms(criterion.name);
+    if (terms.length === 0) return score;
+    return score + (terms.some((term) => text.includes(term)) ? criterion.weight * 4 : 0);
+  }, 0);
+  return required + nice;
 }
 
 function relevanceReason(paper: ResearchPaper, query: string): string {
@@ -205,9 +271,13 @@ function meaningfulTerms(query: string): string[] {
     'science',
     'biology',
     'computational',
-    'foundation'
+    'foundation',
+    'open',
+    'source',
+    'github',
+    'implementation'
   ]);
-  return query.toLowerCase().split(/\W+/).filter((term) => term.length > 2 && !stop.has(term));
+  return [...new Set(query.toLowerCase().split(/\W+/).filter((term) => term.length > 2 && !stop.has(term)))];
 }
 
 function textForPaper(paper: ResearchPaper): string {

@@ -35,6 +35,8 @@ test('research search worker diagnostics record recent service errors', async ()
   const worker = createResearchSearchWorkerService({
     arxivEnabled: true,
     biorxivEnabled: false,
+    biorxivWebEnabled: false,
+    europePmcEnabled: false,
     semanticScholarEnabled: false,
     semanticScholarApiKey: '',
     tavilyEnabled: false,

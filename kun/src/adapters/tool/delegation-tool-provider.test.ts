@@ -96,6 +96,49 @@ describe('buildDelegationToolProviders', () => {
     expect(runChild.mock.calls[0]?.[0].childTimeoutMs).toBe(600_000)
   })
 
+  it('auto-splits broad research delegate_task prompts into parallel focused children', async () => {
+    const { runtime, runChild } = fakeRuntime()
+    const tool = buildDelegationToolProviders(runtime)[0]?.tools.find((candidate) => candidate.name === 'delegate_task')
+
+    const result = await tool?.execute({
+      label: 'GRPO-vs-GSPO-research',
+      prompt: [
+        '你是一个AI研究助理。请调研以下问题：在当前的agentic RL社区中，大家更倾向于选择GRPO还是GSPO？',
+        '请查找以下信息：',
+        '1. GRPO 和 GSPO 的核心区别',
+        '2. 社区选择倾向，包括GitHub、论文引用和讨论热度',
+        '3. 代表性项目或论文',
+        '4. 2024-2025最新趋势'
+      ].join('\n')
+    }, fakeContext())
+
+    expect(result).toMatchObject({
+      isError: false,
+      output: {
+        fanout: true,
+        total: 4,
+        completed: 4,
+        concurrency: 4
+      }
+    })
+    expect(runChild).toHaveBeenCalledTimes(4)
+    expect(runChild.mock.calls.map((call) => call[0].label)).toEqual([
+      'exact-identity-terminology',
+      'scholarly-paper-citations',
+      'code-ecosystem-adoption',
+      'community-discourse-trends'
+    ])
+    expect(String(runChild.mock.calls[0]?.[0].prompt)).toContain('"Group Sequence Policy Optimization"')
+    expect(String(runChild.mock.calls[1]?.[0].prompt)).toContain('不要使用 GitHub star 或社媒作为证据')
+    expect(String(runChild.mock.calls[2]?.[0].prompt)).toContain('不要用论文引用作为主要证据')
+    expect(runChild.mock.calls.map((call) => call[0].allowedToolNames)).toEqual([
+      ['web_search', 'web_fetch', 'mcp_gui_research_research_search'],
+      ['web_search', 'web_fetch', 'mcp_gui_research_research_search'],
+      ['web_search', 'web_fetch', 'mcp_gui_research_research_search'],
+      ['web_search', 'web_fetch', 'mcp_gui_research_research_search']
+    ])
+  })
+
   it('injects guardrails into every delegate_tasks prompt without duplicating existing guardrails', async () => {
     const { runtime, runChild } = fakeRuntime()
     const tool = buildDelegationToolProviders(runtime)[0]?.tools.find((candidate) => candidate.name === 'delegate_tasks')

@@ -1,0 +1,27 @@
+{
+  "task": "retinal lesion classification",
+  "dataset": "ToyRetina-1k",
+  "target_label": "referable_lesion",
+  "primary_metric": "accuracy",
+  "secondary_metrics": ["macro_f1", "auroc"],
+  "split_policy": "patient_level_split",
+  "baseline": {
+    "name": "Baseline-A",
+    "paper": "Internal baseline report v0",
+    "preprocessing": "standard_v1",
+    "image_size": 224,
+    "augmentation": "none"
+  },
+  "method": {
+    "name": "SciForgeNet",
+    "preprocessing": "augmented_v2",
+    "image_size": 256,
+    "augmentation": "random_crop,color_jitter"
+  },
+  "random_seeds": [11, 22, 33],
+  "environment": {
+    "python": "3.11",
+    "cuda": "not recorded",
+    "requirements_lock": "missing"
+  }
+}

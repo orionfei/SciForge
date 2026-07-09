@@ -311,6 +311,116 @@ describe('Codex dynamic MCP tool bridge', () => {
     )
   })
 
+  it('turns research_search MCP failures into non-fatal guidance for the agent', async () => {
+    const bridge = createCodexDynamicMcpToolBridge({
+      servers: [{ id: 'gui_research', command: '/bin/research-mcp' }],
+      clientFactory: async () => fakeMcpClient({
+        tools: [{ name: 'research_search', description: 'Search scientific literature.' }],
+        callTool: vi.fn(async () => {
+          throw new Error('MCP error -32001: Request timed out')
+        })
+      })
+    })
+
+    await bridge.dynamicTools()
+    await expect(bridge.callTool({
+      requestId: 'research-timeout',
+      tool: 'research_search',
+      arguments: { query: 'Qwen3 GLM DeepSeek' }
+    })).resolves.toEqual({
+      contentItems: [{
+        type: 'inputText',
+        text: expect.stringContaining('Do not call research_search again in this turn.')
+      }],
+      success: true
+    })
+  })
+
+  it('turns research_search MCP error results into non-fatal guidance for the agent', async () => {
+    const bridge = createCodexDynamicMcpToolBridge({
+      servers: [{ id: 'gui_research', command: '/bin/research-mcp' }],
+      clientFactory: async () => fakeMcpClient({
+        tools: [{ name: 'research_search', description: 'Search scientific literature.' }],
+        callTool: vi.fn(async () => ({
+          content: [{ type: 'text', text: 'research_search failed: HTTP 429' }],
+          isError: true
+        }))
+      })
+    })
+
+    await bridge.dynamicTools()
+    await expect(bridge.callTool({
+      requestId: 'research-error-result',
+      tool: 'research_search',
+      arguments: { query: 'Qwen3 GLM DeepSeek' }
+    })).resolves.toEqual({
+      contentItems: [{
+        type: 'inputText',
+        text: expect.stringContaining('research_search failed: HTTP 429')
+      }],
+      success: true
+    })
+  })
+
+  it('suppresses research_search after a failed call so later tool catalogs omit it', async () => {
+    const callTool = vi.fn(async () => ({
+      content: [{ type: 'text', text: 'research_search failed: HTTP 503' }],
+      isError: true
+    }))
+    const bridge = createCodexDynamicMcpToolBridge({
+      servers: [{ id: 'gui_research', command: '/bin/research-mcp' }],
+      clientFactory: async () => fakeMcpClient({
+        tools: [{ name: 'research_search', description: 'Search scientific literature.' }],
+        callTool
+      })
+    })
+
+    await expect(bridge.dynamicTools()).resolves.toEqual([expect.objectContaining({
+      name: 'research_search'
+    })])
+    await expect(bridge.callTool({
+      requestId: 'research-unavailable',
+      tool: 'research_search',
+      arguments: { query: 'protein binder design' }
+    })).resolves.toEqual({
+      contentItems: [{
+        type: 'inputText',
+        text: expect.stringContaining('Do not call research_search again in this turn.')
+      }],
+      success: true
+    })
+    await expect(bridge.dynamicTools()).resolves.toEqual([])
+    await expect(bridge.callTool({
+      requestId: 'research-stale-call',
+      tool: 'research_search',
+      arguments: { query: 'protein binder design followup' }
+    })).resolves.toMatchObject({ success: true })
+    expect(callTool).toHaveBeenCalledTimes(1)
+  })
+
+  it('turns stale research_search calls into guidance when the MCP catalog is unavailable', async () => {
+    const bridge = createCodexDynamicMcpToolBridge({
+      servers: [{ id: 'gui_research', command: '/bin/research-mcp' }],
+      clientFactory: async () => fakeMcpClient({
+        listTools: vi.fn(async () => {
+          throw new Error('search service unavailable')
+        })
+      })
+    })
+
+    await expect(bridge.callTool({
+      requestId: 'research-catalog-unavailable',
+      tool: 'research_search',
+      arguments: { query: 'single cell foundation model' }
+    })).resolves.toEqual({
+      contentItems: [{
+        type: 'inputText',
+        text: expect.stringContaining('Do not call research_search again in this turn.')
+      }],
+      success: true
+    })
+  })
+
   it('reconnects and retries once when a cached MCP connection is closed', async () => {
     const firstClose = vi.fn(async () => undefined)
     const firstCallTool = vi.fn(async () => {

@@ -1,0 +1,1 @@
+Our method significantly outperforms Baseline-A on the retinal lesion classification benchmark and is ready to support the main paper claim.

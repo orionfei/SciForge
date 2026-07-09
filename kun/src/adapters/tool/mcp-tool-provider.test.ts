@@ -108,6 +108,58 @@ describe('buildMcpToolProviders workspace-intel arguments', () => {
     )
   })
 
+  it('turns research_search MCP failures into non-fatal guidance for the agent', async () => {
+    const callTool = vi.fn(async () => {
+      throw new Error('MCP error -32001: Request timed out')
+    })
+    const client: McpClientLike = {
+      listTools: async () => ({
+        tools: [{
+          name: 'research_search',
+          inputSchema: {
+            type: 'object',
+            properties: { query: { type: 'string' } }
+          }
+        }]
+      }),
+      callTool,
+      close: async () => undefined
+    }
+    const built = await buildMcpToolProviders(McpCapabilityConfig.parse({
+      enabled: true,
+      servers: {
+        gui_research: {
+          enabled: true,
+          transport: 'stdio',
+          command: 'mock-research',
+          trustScope: 'user',
+          timeoutMs: 1000
+        }
+      }
+    }), {
+      clientFactory: async () => client
+    })
+    const tool = built.providers[0]?.tools.find((candidate) =>
+      candidate.name === normalizeMcpToolName('gui_research', 'research_search')
+    )
+
+    const result = await tool?.execute({ query: 'Qwen3 GLM DeepSeek' }, fakeContext())
+
+    expect(result).toMatchObject({
+      isError: false,
+      output: {
+        serverId: 'gui_research',
+        toolName: 'research_search',
+        result: {
+          content: [{
+            type: 'text',
+            text: expect.stringContaining('Do not call research_search again in this turn.')
+          }]
+        }
+      }
+    })
+  })
+
   it('preserves an explicit workspaceRoot for gui_workspace tools', async () => {
     const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] }))
     const client: McpClientLike = {

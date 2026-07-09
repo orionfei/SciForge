@@ -201,11 +201,25 @@ const CODEX_SPECIALIZED_MCP_DEVELOPER_INSTRUCTIONS = [
   ...CODEX_COMMAND_DOWNLOAD_INSTRUCTION_LINES
 ].join('\n')
 const CODEX_MULTI_AGENT_DEVELOPER_INSTRUCTIONS = [
-  'SciForge provides `delegate_task` for bounded child-agent work.',
-  'Use it when parallel investigation or independent implementation subtasks materially help the user request.',
+  'SciForge provides `delegate_research` for multi-agent research orchestration and `delegate_task` for one bounded child-agent task.',
+  'For scientific literature research, related-work discovery, survey/report requests, benchmark/background investigation, community-adoption questions, or tasks where the user asks to "调研", "找相关工作", "综述", "survey", "related work", "papers", "literature", or current research context, use `delegate_research` before writing the final answer unless the user explicitly says not to use subagents.',
+  '`delegate_research` decomposes the user query into subtopics, runs child agents under the configured parallel budget, and asks each child to call `research_search` first when available.',
+  'Do not call research_search directly from the parent thread for research tasks; research_search is reserved for delegated child agents so the parent can synthesize child evidence.',
+  'Use `delegate_task` for narrow single-subtask delegation or non-research child work; for broad research questions prefer `delegate_research` over multiple manual `delegate_task` calls.',
+  'If `delegate_research`, `delegate_task`, or `research_search` is unavailable, say that the research delegation/search tool is unavailable and continue with the best available evidence instead of pretending a live search happened.',
+  'Research child agents should rely on research_search only; do not ask them to use shell, curl, browser automation, or generic scraping unless the user explicitly requests source fetching.',
+  'Use `delegate_task` when parallel investigation or independent implementation subtasks materially help the user request.',
   'Give each child a concise label and a self-contained prompt; do not use it for trivial work or as a substitute for doing the main task.',
+  'Never narrate long search plans, query expansions, or repeated "let me search" text to the user. Keep the visible answer concise, deduplicated, and directly responsive.',
+  'For research/survey/community-adoption answers, do not paste the full child report. Synthesize it in the user language using at most 8 bullets or about 1000 Chinese characters unless the user explicitly requests a detailed report.',
+  'For current agentic RL or LLM-agent RL questions, the final answer must include a freshness audit for recent 2025-2026 algorithms/systems such as GSPO, DAPO, Dr.GRPO, VAPO, SAPO, Agent Lightning/LightningRL, Flow-GRPO, and VSPO when child reports or tool guidance mention them. Never present a PPO/GRPO/DPO/RLOO-only answer as comprehensive.',
+  'Do not say you are answering from existing knowledge after using delegation/search. Base the answer on child reports and explicitly mark missing or weakly supported recent methods as gaps.',
   'Treat the tool result as the child agent answer, the same way you would read an assistant response.'
 ].join('\n')
+const PARENT_DELEGATED_RESEARCH_TOOL_NAMES = new Set([
+  'research_search',
+  'research_search_diagnostics'
+])
 const CODEX_THREAD_FALLBACK_TITLE = 'Codex thread'
 const MAX_CODEX_THREAD_TITLE_LENGTH = 80
 const CODEX_PLACEHOLDER_THREAD_TITLES = new Set([
@@ -990,14 +1004,26 @@ export class CodexRuntimeService {
 
   private async codexDynamicTools(
     settings?: AppSettingsV1,
-    options: { includeMultiAgent?: boolean } = {}
+    options: {
+      includeMultiAgent?: boolean
+      allowedToolNames?: readonly string[]
+      strictAllowedToolNames?: boolean
+    } = {}
   ): Promise<CodexAppServerDynamicToolSpec[]> {
     const current = settings ?? await this.options.settings()
     const includeMultiAgent = options.includeMultiAgent !== false
-    return [
-      ...(includeMultiAgent ? this.ensureCodexMultiAgentBridge(current)?.dynamicTools() ?? [] : []),
-      ...(await this.dynamicMcpBridge?.dynamicTools() ?? [])
+    const multiAgentTools = includeMultiAgent
+      ? this.ensureCodexMultiAgentBridge(current)?.dynamicTools() ?? []
+      : []
+    const mcpTools = await this.dynamicMcpBridge?.dynamicTools() ?? []
+    const delegatedMcpTools = includeMultiAgent && multiAgentTools.length > 0
+      ? mcpTools.filter((tool) => !PARENT_DELEGATED_RESEARCH_TOOL_NAMES.has(tool.name))
+      : mcpTools
+    const tools = [
+      ...multiAgentTools,
+      ...delegatedMcpTools
     ]
+    return filterCodexDynamicToolsForChildPolicy(tools, options)
   }
 
   private async handleDynamicToolCall(
@@ -1101,7 +1127,11 @@ export class CodexRuntimeService {
     const settings = await this.options.settings()
     const { client } = await this.ensureConnectedClient(settings)
     const workspace = resolveCodexWorkspace(settings, input.workspace)
-    const dynamicTools = await this.codexDynamicTools(settings, { includeMultiAgent: false })
+    const dynamicTools = await this.codexDynamicTools(settings, {
+      includeMultiAgent: false,
+      allowedToolNames: input.allowedToolNames,
+      strictAllowedToolNames: input.strictAllowedToolNames
+    })
     const threadResponse = await client.startThread({
       ...baseThreadParams(settings, workspace, {
         specializedMcpConfigured: this.hasDynamicMcpServersConfigured(),
@@ -1149,7 +1179,11 @@ export class CodexRuntimeService {
     try {
       const turnResponse = await client.startTurn(turnStartParams({
         threadId: childCodexThreadId,
-        text: input.prompt,
+        text: codexChildPrompt(input.prompt, {
+          allowedToolNames: input.allowedToolNames,
+          maxToolCalls: input.maxToolCalls
+        }),
+        displayText: input.prompt,
         workspace,
         model: codexModelRouterModel(settings),
         runtime: getCodexRuntimeSettings(settings)
@@ -2532,6 +2566,29 @@ function baseThreadParams(
   }
 }
 
+function filterCodexDynamicToolsForChildPolicy(
+  tools: CodexAppServerDynamicToolSpec[],
+  options: {
+    allowedToolNames?: readonly string[]
+    strictAllowedToolNames?: boolean
+  }
+): CodexAppServerDynamicToolSpec[] {
+  if (!options.strictAllowedToolNames) return tools
+  const allowed = new Set((options.allowedToolNames ?? []).map((name) => name.trim()).filter(Boolean))
+  if (allowed.size === 0) return []
+  return tools.filter((tool) => isAllowedChildDynamicToolName(tool.name, allowed))
+}
+
+function isAllowedChildDynamicToolName(name: string, allowed: ReadonlySet<string>): boolean {
+  const normalized = name.trim()
+  const tail = normalized.split('.').at(-1) ?? normalized
+  for (const allowedName of allowed) {
+    if (normalized === allowedName || tail === allowedName) return true
+    if (normalized.endsWith(`_${allowedName}`) || tail.endsWith(`_${allowedName}`)) return true
+  }
+  return false
+}
+
 function dynamicDeveloperInstructions(input: {
   specializedMcpConfigured?: boolean
   multiAgentConfigured?: boolean
@@ -2554,6 +2611,35 @@ function codexModelRouterThreadParams(
 function codexModelRouterModel(settings: AppSettingsV1): string {
   void settings
   return DEFAULT_MODEL_ROUTER_PUBLIC_MODEL_ALIAS
+}
+
+function codexChildPrompt(
+  prompt: string,
+  options: {
+    allowedToolNames?: readonly string[]
+    maxToolCalls?: number
+  } = {}
+): string {
+  const allowedTools = options.allowedToolNames?.length
+    ? `Only these dynamic tools are available for this child task: ${options.allowedToolNames.join(', ')}. Do not try alternate web, GitHub, shell, browser, or fetch tools if they are absent.`
+    : ''
+  const maxToolCalls = options.maxToolCalls && options.maxToolCalls > 0
+    ? `Use at most ${options.maxToolCalls} tool call(s) total.`
+    : 'Use at most 3 focused searches total.'
+  return [
+    'You are a delegated SciForge child agent. Work silently and return only the useful result.',
+    'If the task is research, call `research_search` first when available.',
+    maxToolCalls,
+    allowedTools,
+    'For research tasks, do not use shell commands, curl, wget, browser automation, web_fetch, web_search, GitHub fetch, generic web scraping, or approval-gated commands. After research_search, summarize the evidence.',
+    'Do not narrate plans, do not print long query expansions, and do not repeat sentences.',
+    'Return in the same language as the parent task; if the parent task is Chinese, answer in Chinese.',
+    'Return a concise answer that the parent can show directly to the user: at most 6 bullets, no tables, no long background section.',
+    'Include only the most important titles/years/URLs/source coverage, key findings, and limitations.',
+    'Keep the final child answer under 900 Chinese characters or 300 English words unless the parent explicitly asks for more.',
+    '',
+    prompt
+  ].filter(Boolean).join('\n')
 }
 
 function turnStartParams(input: {

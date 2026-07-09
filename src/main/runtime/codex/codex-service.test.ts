@@ -1783,19 +1783,25 @@ describe('CodexRuntimeService compatibility operations', () => {
     })
 
     expect(client.startThread).toHaveBeenCalledWith(expect.objectContaining({
-      dynamicTools: expect.arrayContaining([{
-        type: 'function',
-        name: 'research_search',
-        description: 'Search research papers.',
-        inputSchema: { type: 'object', properties: { query: { type: 'string' } } }
-      }]),
       developerInstructions: expect.stringContaining('specialized MCP tools')
     }))
+    const parentStartThreadParams = vi.mocked(client.startThread).mock.calls[0]?.[0] as {
+      dynamicTools?: Array<{ name?: string }>
+    }
+    expect(parentStartThreadParams.dynamicTools ?? []).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'research_search' })
+    ]))
     expect(client.startThread).toHaveBeenCalledWith(expect.objectContaining({
       dynamicTools: expect.arrayContaining([
         expect.objectContaining({ name: 'delegate_task' })
       ]),
       developerInstructions: expect.stringContaining('delegate_task')
+    }))
+    expect(client.startThread).toHaveBeenCalledWith(expect.objectContaining({
+      developerInstructions: expect.stringContaining('related-work discovery')
+    }))
+    expect(client.startThread).toHaveBeenCalledWith(expect.objectContaining({
+      developerInstructions: expect.stringContaining('`research_search` first')
     }))
     expect(client.startThread).toHaveBeenCalledWith(expect.objectContaining({
       developerInstructions: expect.stringContaining('stream to a `.part` file')
@@ -1849,6 +1855,9 @@ describe('CodexRuntimeService compatibility operations', () => {
       ]),
       developerInstructions: expect.stringContaining('delegate_task')
     }))
+    expect(queued.client.startThread).toHaveBeenCalledWith(expect.objectContaining({
+      developerInstructions: expect.stringContaining('scientific literature research')
+    }))
 
     const pending = pendingServerRequests?.onToolCallRequest?.({
       requestId: 'multi-agent-request-1',
@@ -1867,7 +1876,7 @@ describe('CodexRuntimeService compatibility operations', () => {
         model: DEFAULT_MODEL_ROUTER_PUBLIC_MODEL_ALIAS,
         modelProvider: DEFAULT_MODEL_ROUTER_PROVIDER_ID,
         input: expect.arrayContaining([
-          expect.objectContaining({ text: 'Return child-ok only.' })
+          expect.objectContaining({ text: expect.stringContaining('Return child-ok only.') })
         ])
       }))
     })
@@ -1940,6 +1949,126 @@ describe('CodexRuntimeService compatibility operations', () => {
           })
         })
       })
+    })
+    queued.close()
+  })
+
+  it('limits research-like Codex child threads to research dynamic tools', async () => {
+    const queued = clientWithQueuedEvents()
+    const storageRoot = await tempRoot()
+    let pendingServerRequests: CodexAppServerPendingRequestRegistryOptions | undefined
+    vi.mocked(queued.client.startThread)
+      .mockResolvedValueOnce({ thread: { id: 'parent-codex-thread' } })
+      .mockResolvedValueOnce({ thread: { id: 'child-codex-thread' } })
+    vi.mocked(queued.client.startTurn).mockResolvedValueOnce({ turn: { id: 'child-turn' } })
+    const mcpClient: CodexDynamicMcpClient = {
+      listTools: vi.fn(async () => ({
+        tools: [
+          {
+            name: 'research.search',
+            description: 'Search research papers.',
+            inputSchema: { type: 'object', properties: { query: { type: 'string' } } }
+          },
+          {
+            name: 'research.search_diagnostics',
+            description: 'Inspect research search diagnostics.',
+            inputSchema: { type: 'object', properties: {} }
+          },
+          {
+            name: 'web.fetch',
+            description: 'Fetch web pages.',
+            inputSchema: { type: 'object', properties: { url: { type: 'string' } } }
+          },
+          {
+            name: 'github.fetch',
+            description: 'Fetch GitHub repository data.',
+            inputSchema: { type: 'object', properties: { repo: { type: 'string' } } }
+          }
+        ]
+      })),
+      callTool: vi.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] })),
+      close: vi.fn(async () => undefined)
+    }
+    const service = new CodexRuntimeService({
+      settings: async () => settings(),
+      sink: { send: vi.fn() },
+      storageRoot,
+      managedMcpServers: [{ id: 'research', command: '/bin/research-mcp' }],
+      mcpClientFactory: async () => mcpClient,
+      createClient: (options) => {
+        pendingServerRequests = options.pendingServerRequests as CodexAppServerPendingRequestRegistryOptions
+        return queued.client
+      }
+    })
+
+    await expect(service.startThread({ threadId: 'parent-gui-thread', title: 'Parent' })).resolves.toMatchObject({
+      ok: true
+    })
+    const pending = pendingServerRequests?.onToolCallRequest?.({
+      requestId: 'manual-research-child',
+      threadId: 'parent-codex-thread',
+      turnId: 'parent-turn',
+      tool: 'delegate_task',
+      arguments: {
+        label: 'code_ecosystem',
+        prompt: 'Research the code ecosystem and open-source implementations for agentic RL algorithms.'
+      }
+    })
+
+    await vi.waitFor(() => {
+      expect(queued.client.startThread).toHaveBeenCalledTimes(2)
+    })
+    const childStartThreadParams = vi.mocked(queued.client.startThread).mock.calls[1]?.[0] as {
+      dynamicTools?: Array<{ name?: string }>
+    }
+    expect((childStartThreadParams.dynamicTools ?? []).map((tool) => tool.name).sort()).toEqual([
+      'research_search',
+      'research_search_diagnostics'
+    ])
+    await vi.waitFor(() => {
+      expect(queued.client.startTurn).toHaveBeenCalledWith(expect.objectContaining({
+        input: expect.arrayContaining([
+          expect.objectContaining({
+            text: expect.stringContaining('Only these dynamic tools are available for this child task: research_search, research_search_diagnostics')
+          })
+        ])
+      }))
+    })
+
+    queued.push({
+      type: 'event',
+      channel: CODEX_MAIN_IPC_CHANNELS.event,
+      payload: {
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId: 'child-codex-thread',
+          turnId: 'child-turn',
+          text: 'research-child-ok'
+        }
+      }
+    })
+    queued.push({
+      type: 'event',
+      channel: CODEX_MAIN_IPC_CHANNELS.event,
+      payload: {
+        method: 'turn/completed',
+        params: {
+          threadId: 'child-codex-thread',
+          turnId: 'child-turn'
+        }
+      }
+    })
+    await expect(pending).resolves.toMatchObject({
+      success: true,
+      contentItems: [{
+        type: 'inputText',
+        text: expect.stringContaining('research-child-ok')
+      }]
+    })
+    await expect(pending).resolves.toMatchObject({
+      contentItems: [{
+        text: expect.stringContaining('Parent synthesis constraint')
+      }]
     })
     queued.close()
   })

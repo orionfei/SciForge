@@ -18,11 +18,27 @@ const S2_FIELDS = [
   'abstract',
   'url'
 ].join(',');
+const DEFAULT_MIN_INTERVAL_MS = 1_100;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_BASE_DELAY_MS = 1_500;
+
+type SemanticScholarProviderOptions = {
+  minIntervalMs?: number;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
+  delayImpl?: (ms: number) => Promise<void>;
+};
+
+let nextRequestAt = 0;
+let rateLimitQueue = Promise.resolve();
 
 export class SemanticScholarResearchProvider implements ResearchSearchProvider {
   readonly id = 'semantic_scholar' as const;
 
-  constructor(private readonly apiKey = '') {}
+  constructor(
+    private readonly apiKey = '',
+    private readonly options: SemanticScholarProviderOptions = {}
+  ) {}
 
   async search(request: ResearchSearchRequest): Promise<ResearchSearchProviderResult> {
     const url = new URL(S2_SEARCH_URL);
@@ -31,7 +47,7 @@ export class SemanticScholarResearchProvider implements ResearchSearchProvider {
     url.searchParams.set('fields', S2_FIELDS);
     if (request.sinceYear) url.searchParams.set('year', `${request.sinceYear}-`);
     try {
-      const json = await fetchJson(url.href, request.timeoutMs, request.signal, { headers: this.headers() });
+      const json = await this.fetchWithRateLimitAndRetry(url.href, request);
       const papers = parseSemanticScholarPapers(json);
       return {
         papers,
@@ -62,6 +78,53 @@ export class SemanticScholarResearchProvider implements ResearchSearchProvider {
       ? { Accept: 'application/json', 'x-api-key': this.apiKey.trim() }
       : { Accept: 'application/json' };
   }
+
+  private async fetchWithRateLimitAndRetry(url: string, request: ResearchSearchRequest): Promise<unknown> {
+    const maxRetries = finiteInt(this.options.maxRetries, DEFAULT_MAX_RETRIES);
+    let attempt = 0;
+    for (;;) {
+      try {
+        await this.waitForGlobalRateLimit();
+        return await fetchJson(url, request.timeoutMs, request.signal, { headers: this.headers() });
+      } catch (error) {
+        if (!isHttp429(error) || attempt >= maxRetries || request.signal.aborted) throw error;
+        const delayMs = retryDelayMs(this.options.retryBaseDelayMs, attempt);
+        await (this.options.delayImpl ?? delay)(delayMs);
+        attempt += 1;
+      }
+    }
+  }
+
+  private waitForGlobalRateLimit(): Promise<void> {
+    const minIntervalMs = finiteInt(this.options.minIntervalMs, DEFAULT_MIN_INTERVAL_MS);
+    if (minIntervalMs <= 0) return Promise.resolve();
+    const wait = rateLimitQueue.then(async () => {
+      const now = Date.now();
+      const delayMs = Math.max(0, nextRequestAt - now);
+      if (delayMs > 0) await (this.options.delayImpl ?? delay)(delayMs);
+      nextRequestAt = Date.now() + minIntervalMs;
+    });
+    rateLimitQueue = wait.catch(() => undefined);
+    return wait;
+  }
+}
+
+function isHttp429(error: unknown): boolean {
+  return error instanceof Error && /\bHTTP 429\b/.test(error.message);
+}
+
+function retryDelayMs(baseDelayMs: number | undefined, attempt: number): number {
+  return finiteInt(baseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS) * (2 ** attempt);
+}
+
+function finiteInt(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : fallback;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseSemanticScholarPapers(value: unknown): ResearchPaper[] {

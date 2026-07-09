@@ -16,9 +16,23 @@ export type ResearchDomain =
   | 'climate'
   | 'general';
 
-export type ResearchSourceKind = 'arxiv' | 'biorxiv' | 'europe_pmc' | 'semantic_scholar' | 'web' | 'cns';
+export type ResearchSourceKind =
+  | 'arxiv'
+  | 'biorxiv'
+  | 'biorxiv_web'
+  | 'europe_pmc'
+  | 'semantic_scholar'
+  | 'web'
+  | 'cns';
 
-export type ResearchProviderId = 'arxiv' | 'biorxiv' | 'europe_pmc' | 'semantic_scholar' | 'tavily' | 'cns';
+export type ResearchProviderId =
+  | 'arxiv'
+  | 'biorxiv'
+  | 'biorxiv_web'
+  | 'europe_pmc'
+  | 'semantic_scholar'
+  | 'tavily'
+  | 'cns';
 
 export type ResearchSearchRequest = {
   query: string;
@@ -51,7 +65,7 @@ export type ResearchWebResult = {
   title: string;
   url: string;
   snippet: string;
-  source: 'tavily' | 'cns';
+  source: 'tavily' | 'biorxiv_web' | 'cns';
   rank: number;
 };
 
@@ -77,6 +91,7 @@ export interface ResearchSearchProvider {
 export type ResearchSearchConfig = {
   arxivEnabled: boolean;
   biorxivEnabled: boolean;
+  biorxivWebEnabled: boolean;
   europePmcEnabled: boolean;
   semanticScholarEnabled: boolean;
   semanticScholarApiKey: string;
@@ -105,6 +120,31 @@ export type ResearchSearchOutput = {
     intent: ResearchIntent;
     domain: ResearchDomain;
     rationale: string;
+  };
+  searchPlan: {
+    normalizedGoal: string;
+    language: 'zh' | 'en' | 'mixed';
+    content: string;
+    rewrittenQuery: string;
+    keywordQuery: string;
+    coreConcepts: string[];
+    methods: string[];
+    entities: string[];
+    metadata: {
+      earliestYear?: number;
+      latestYear?: number;
+      authors: string[];
+      venues: string[];
+      fieldsOfStudy: string[];
+      recency: 'recent' | 'early' | null;
+      centrality: 'central' | 'less_cited' | null;
+      queryType: 'specific' | 'broad';
+    };
+    relevanceCriteria: {
+      required: Array<{ name: string; description: string; weight: number }>;
+      niceToHave: Array<{ name: string; description: string; weight: number }>;
+    };
+    sourceQueries: Partial<Record<ResearchSourceKind, string[]>>;
   };
   generatedQueries: string[];
   papers: ResearchPaper[];

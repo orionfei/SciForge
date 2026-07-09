@@ -82,6 +82,7 @@ const DEFAULT_TOOL_LOOP_MAX_RECOVERY_STEPS = 1
 const DEFAULT_TOOL_LOOP_NON_PROGRESS_THRESHOLD = 3
 const DEFAULT_TOOL_LOOP_MAX_STEPS_AFTER_RECOVERY = 8
 const MAX_INTERNAL_TOOL_CALL_MARKUP_RECOVERY_STEPS = 2
+const MAX_DELEGATED_RESEARCH_NO_TOOL_RECOVERY_STEPS = 1
 const DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS = 15_000
 const DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS = 1_200
 const DEFAULT_COMPACTION_SUMMARY_INPUT_MAX_BYTES = 96 * 1024
@@ -539,6 +540,7 @@ export class AgentLoop {
   private readonly goalNoToolRecoveryStepsByTurn = new Map<string, number>()
   private readonly modelStreamErrorRecoveryStepsByTurn = new Map<string, number>()
   private readonly internalToolCallMarkupRecoveryStepsByTurn = new Map<string, number>()
+  private readonly delegatedResearchNoToolRecoveryStepsByTurn = new Map<string, number>()
 
   constructor(opts: AgentLoopOptions) {
     this.opts = opts
@@ -604,6 +606,7 @@ export class AgentLoop {
       this.goalNoToolRecoveryStepsByTurn.delete(turnId)
       this.modelStreamErrorRecoveryStepsByTurn.delete(turnId)
       this.internalToolCallMarkupRecoveryStepsByTurn.delete(turnId)
+      this.delegatedResearchNoToolRecoveryStepsByTurn.delete(turnId)
     }
   }
 
@@ -914,6 +917,7 @@ export class AgentLoop {
     await this.recordPipelineStage(threadId, turnId, 'input_compressed', {
       historyItems: history.length
     })
+    const delegatedResearchInstruction = delegatedResearchToolUseInstruction(effectiveToolSpecs)
     const specializedToolInstruction = specializedToolUseInstruction(effectiveToolSpecs)
     const contextInstructions = [
       ...(activeGoalInstruction ? [activeGoalInstruction] : []),
@@ -929,6 +933,10 @@ export class AgentLoop {
       ...memoryInstructions(memories),
       ...skillResolution.instructions,
       ...(turn?.remoteTargetId ? [remoteTargetInstruction(turn.remoteTargetId)] : []),
+      ...(delegatedResearchInstruction ? [delegatedResearchInstruction] : []),
+      ...((this.delegatedResearchNoToolRecoveryStepsByTurn.get(turnId) ?? 0) > 0
+        ? [delegatedResearchNoToolRecoveryInstruction()]
+        : []),
       ...(specializedToolInstruction ? [specializedToolInstruction] : []),
       ...(effectiveToolSpecs.some((tool) => tool.name === 'bash') ? [shellRuntimeInstruction()] : []),
       ...(toolCatalogDriftMessage ? [toolCatalogDriftMessage] : [])
@@ -1131,6 +1139,34 @@ export class AgentLoop {
           status: 'completed'
         })
       )
+    }
+    if (
+      stopReason === 'stop' &&
+      completedToolCalls.length === 0 &&
+      shouldRecoverDelegatedResearchNoTool({
+        tools: effectiveToolSpecs,
+        latestUserText: latestUserMessageText(healed.items, turnId) || turn?.prompt || '',
+        items: healed.items,
+        turnId
+      })
+    ) {
+      const recoverySteps = (this.delegatedResearchNoToolRecoveryStepsByTurn.get(turnId) ?? 0) + 1
+      if (recoverySteps <= MAX_DELEGATED_RESEARCH_NO_TOOL_RECOVERY_STEPS) {
+        this.delegatedResearchNoToolRecoveryStepsByTurn.set(turnId, recoverySteps)
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message: 'Research delegation required for this turn; retrying before accepting a direct final answer.',
+          code: 'delegated_research_required',
+          severity: 'warning',
+          details: {
+            stepIndex,
+            recoverySteps
+          }
+        })
+        return 'continue'
+      }
     }
     if (textAccumulator.value && !isInternalToolCallMarkup(textAccumulator.value)) {
       const itemId = textItemId || this.opts.ids.next('item_text')
@@ -2878,6 +2914,72 @@ function memoryInstructions(memories: Array<{ id: string; content: string; scope
       ...memories.map((memory) => `- [${memory.id}] (${memory.scope}) ${memory.content}`)
     ].join('\n')
   ]
+}
+
+export function delegatedResearchToolUseInstruction(tools: ModelToolSpec[]): string | undefined {
+  const hasDelegateTask = tools.some((tool) => tool.name === 'delegate_task' || tool.name === 'delegate_tasks')
+  if (!hasDelegateTask) return undefined
+  return [
+    'Delegated research workflow:',
+    '- For scientific literature research, related-work discovery, survey/report requests, benchmark/background investigation, community-adoption checks, or user requests containing 调研, 综述, related work, papers, literature, survey, or current research context, use `delegate_tasks` before writing the final answer.',
+    '- Split broad research tasks into 3-5 parallel child tasks by evidence-isolated direction, for example: exact terminology/identity verification, scholarly papers/citations, code ecosystem adoption, community discussion/tutorials, and negative evidence/ambiguity checks.',
+    '- Use a single `delegate_task` only for a genuinely narrow follow-up. For broad research, batch delegation is required so child agents can search independently and in parallel.',
+    '- The parent thread should synthesize child-agent evidence instead of doing direct literature search itself.',
+    '- Give each research child a focused prompt and ask it to use the available research/search tools first, then return concise titles, years, URLs/source coverage, key findings, and limitations.',
+    '- Do not narrate long search plans or repeated query expansions to the user; keep the visible final answer concise and deduplicated.'
+  ].join('\n')
+}
+
+function delegatedResearchNoToolRecoveryInstruction(): string {
+  return [
+    'Delegated research recovery:',
+    '- The previous assistant response tried to answer a research/survey request without using delegation.',
+    '- Do not write a final answer yet. Call `delegate_tasks` now with 3-5 evidence-isolated child research tasks.',
+    '- At minimum split into exact terminology/identity verification, scholarly papers/citations, code ecosystem adoption, and community discussion/tutorials.'
+  ].join('\n')
+}
+
+export function shouldRecoverDelegatedResearchNoTool(input: {
+  tools: readonly ModelToolSpec[];
+  latestUserText: string;
+  items: readonly TurnItem[];
+  turnId: string;
+}): boolean {
+  const hasDelegationTool = input.tools.some((tool) => tool.name === 'delegate_task' || tool.name === 'delegate_tasks')
+  if (!hasDelegationTool) return false
+  if (hasSuccessfulDelegationResult(input.items, input.turnId)) return false
+  return isDelegatedResearchRequest(input.latestUserText)
+}
+
+function hasSuccessfulDelegationResult(items: readonly TurnItem[], turnId: string): boolean {
+  return items.some((item) =>
+    item.turnId === turnId &&
+    item.kind === 'tool_result' &&
+    item.isError !== true &&
+    (item.toolName === 'delegate_task' || item.toolName === 'delegate_tasks')
+  )
+}
+
+function isDelegatedResearchRequest(text: string): boolean {
+  const normalized = text.toLowerCase()
+  if (!normalized.trim()) return false
+  return [
+    /调研/,
+    /综述/,
+    /相关工作/,
+    /论文/,
+    /社区.*(?:选择|采用|趋势|讨论)/,
+    /(?:选择|采用|趋势|讨论).*社区/,
+    /\bresearch\b/,
+    /\bsurvey\b/,
+    /\bliterature\b/,
+    /\brelated work\b/,
+    /\bpapers?\b/,
+    /\bcommunity adoption\b/,
+    /\bcurrent research\b/,
+    /\btrend\b/,
+    /\bbenchmark\b/
+  ].some((pattern) => pattern.test(normalized))
 }
 
 function specializedToolUseInstruction(tools: ModelToolSpec[]): string | undefined {

@@ -25,8 +25,9 @@ import type {
 
 const DEFAULT_MAX_RESULTS = 10;
 const DEFAULT_TIMEOUT_MS = 15_000;
-const MAX_QUERY_COUNT = 3;
+const MAX_QUERY_COUNT = 5;
 const DEFAULT_CNS_DOMAINS = ['nature.com', 'science.org', 'cell.com'];
+const DEFAULT_BIORXIV_WEB_DOMAINS = ['biorxiv.org'];
 
 type ProviderEntry = {
   source: ResearchSourceKind;
@@ -55,13 +56,16 @@ export class ResearchSearchService {
     const query = input.query.trim();
     if (!query) throw new Error('query is required');
     const maxResults = boundedInt(input.maxResults, this.config.maxResults, 1, this.config.maxResults);
-    const sinceYear = boundedYear(input.sinceYear, this.config.defaultSinceYear);
     const plan = planResearchQueries({
       query,
       intent: input.intent,
       domain: input.domain,
       maxQueries: MAX_QUERY_COUNT
     });
+    const sinceYear = boundedYear(
+      input.sinceYear,
+      this.config.defaultSinceYear ?? plan.analysis.metadata.earliestYear
+    );
     const sources = normalizeSources(input.sources);
     const activeProviders = this.providers.filter((item) => !sources || sources.includes(item.source));
     if (activeProviders.length === 0) {
@@ -71,11 +75,12 @@ export class ResearchSearchService {
     const diagnostics: ResearchProviderDiagnostic[] = [];
     const papers: ResearchPaper[] = [];
     const webResults: ResearchWebResult[] = [];
-    const perQueryLimit = Math.max(1, Math.ceil(maxResults / Math.max(1, Math.min(3, plan.generatedQueries.length))));
     const signal = input.signal ?? new AbortController().signal;
-    for (const generatedQuery of plan.generatedQueries) {
-      const results = await Promise.all(activeProviders.map(({ provider }) =>
-        provider.search({
+    const searchJobs = activeProviders.flatMap(({ source, provider }) => {
+      const sourceQueries = queriesForSource(plan.sourceQueries[source], plan.generatedQueries, MAX_QUERY_COUNT);
+      const perQueryLimit = Math.max(1, Math.ceil(maxResults / sourceQueries.length));
+      return sourceQueries.map((generatedQuery) =>
+        safeProviderSearch(provider, {
           query: generatedQuery,
           intent: plan.interpretedIntent.intent,
           domain: plan.interpretedIntent.domain,
@@ -84,18 +89,22 @@ export class ResearchSearchService {
           timeoutMs: this.config.timeoutMs || DEFAULT_TIMEOUT_MS,
           signal
         })
-      ));
-      for (const result of results) {
-        papers.push(...result.papers);
-        webResults.push(...result.webResults);
-        diagnostics.push(...(result.diagnostics ?? []));
-      }
+      );
+    });
+    const results = await Promise.all(searchJobs);
+    for (const result of results) {
+      papers.push(...result.papers);
+      webResults.push(...result.webResults);
+      diagnostics.push(...(result.diagnostics ?? []));
     }
 
     const rankedPapers = mergeAndRankPapers({
       papers,
-      query,
+      query: plan.analysis.keywordQuery || plan.normalizedGoal,
       intent: plan.interpretedIntent.intent,
+      relevanceCriteria: plan.analysis.relevanceCriteria,
+      centrality: plan.analysis.metadata.centrality,
+      recency: plan.analysis.metadata.recency,
       maxResults
     });
     const rankedWebResults = mergeAndRankWebResults({
@@ -112,6 +121,19 @@ export class ResearchSearchService {
         'Do not paste raw structured JSON unless the user explicitly requested raw output.'
       ].join(' '),
       interpretedIntent: plan.interpretedIntent,
+      searchPlan: {
+        normalizedGoal: plan.normalizedGoal,
+        language: plan.language,
+        content: plan.analysis.content,
+        rewrittenQuery: plan.analysis.rewrittenQuery,
+        keywordQuery: plan.analysis.keywordQuery,
+        coreConcepts: plan.coreConcepts,
+        methods: plan.methods,
+        entities: plan.entities,
+        metadata: plan.analysis.metadata,
+        relevanceCriteria: plan.analysis.relevanceCriteria,
+        sourceQueries: plan.sourceQueries
+      },
       generatedQueries: plan.generatedQueries,
       papers: rankedPapers,
       webResults: rankedWebResults,
@@ -141,6 +163,7 @@ export function researchSearchConfigFromEnv(env: Record<string, string | undefin
   return {
     arxivEnabled: booleanEnv(env, 'SCIFORGE_RESEARCH_ARXIV_ENABLED', true),
     biorxivEnabled: booleanEnv(env, 'SCIFORGE_RESEARCH_BIORXIV_ENABLED', true),
+    biorxivWebEnabled: booleanEnv(env, 'SCIFORGE_RESEARCH_BIORXIV_WEB_ENABLED', Boolean(tavilyApiKey)),
     europePmcEnabled: booleanEnv(env, 'SCIFORGE_RESEARCH_EUROPE_PMC_ENABLED', true),
     semanticScholarEnabled: booleanEnv(env, 'SCIFORGE_RESEARCH_SEMANTIC_SCHOLAR_ENABLED', true),
     semanticScholarApiKey,
@@ -161,6 +184,16 @@ function buildProviderEntries(
   const entries: ProviderEntry[] = [];
   if (config.arxivEnabled) entries.push({ source: 'arxiv', provider: providers.arxiv ?? new ArxivResearchProvider() });
   if (config.biorxivEnabled) entries.push({ source: 'biorxiv', provider: providers.biorxiv ?? new BiorxivResearchProvider() });
+  if (config.biorxivWebEnabled) {
+    entries.push({
+      source: 'biorxiv_web',
+      provider: providers.biorxiv_web ?? new TavilyResearchProvider(config.tavilyApiKey, {
+        id: 'biorxiv_web',
+        includeDomains: DEFAULT_BIORXIV_WEB_DOMAINS,
+        resultSource: 'biorxiv_web'
+      })
+    });
+  }
   if (config.europePmcEnabled) {
     entries.push({
       source: 'europe_pmc',
@@ -202,6 +235,14 @@ function configuredDiagnostics(config: ResearchSearchConfig): ResearchProviderDi
       available: config.biorxivEnabled
     },
     {
+      id: 'biorxiv_web',
+      enabled: config.biorxivWebEnabled,
+      available: config.biorxivWebEnabled && Boolean(config.tavilyApiKey.trim()),
+      ...(config.biorxivWebEnabled && !config.tavilyApiKey.trim()
+        ? { reason: 'Tavily API key is required for bioRxiv domain search' }
+        : {})
+    },
+    {
       id: 'europe_pmc',
       enabled: config.europePmcEnabled,
       available: config.europePmcEnabled
@@ -233,6 +274,7 @@ function normalizeSources(value: unknown): ResearchSourceKind[] | null {
   const out = value.filter((item): item is ResearchSourceKind =>
     item === 'arxiv' ||
     item === 'biorxiv' ||
+    item === 'biorxiv_web' ||
     item === 'europe_pmc' ||
     item === 'semantic_scholar' ||
     item === 'web' ||
@@ -275,7 +317,38 @@ function citationsFor(
 }
 
 function allSources(): ResearchSourceKind[] {
-  return ['arxiv', 'biorxiv', 'europe_pmc', 'semantic_scholar', 'web', 'cns'];
+  return ['arxiv', 'biorxiv', 'biorxiv_web', 'europe_pmc', 'semantic_scholar', 'web', 'cns'];
+}
+
+function queriesForSource(
+  sourceQueries: string[] | undefined,
+  fallbackQueries: string[],
+  maxQueries: number
+): string[] {
+  const queries = (sourceQueries?.length ? sourceQueries : fallbackQueries)
+    .map((query) => query.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  return [...new Set(queries)].slice(0, Math.max(1, maxQueries));
+}
+
+async function safeProviderSearch(
+  provider: ResearchSearchProvider,
+  request: Parameters<ResearchSearchProvider['search']>[0]
+): Promise<Awaited<ReturnType<ResearchSearchProvider['search']>>> {
+  try {
+    return await provider.search(request);
+  } catch (error) {
+    return {
+      papers: [],
+      webResults: [],
+      diagnostics: [{
+        id: provider.id,
+        enabled: true,
+        available: false,
+        reason: errorMessage(error)
+      }]
+    };
+  }
 }
 
 function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -313,4 +386,8 @@ function listEnv(env: Record<string, string | undefined>, name: string, fallback
   if (!value) return fallback;
   const items = value.split(',').map((item) => item.trim()).filter(Boolean);
   return items.length ? items : fallback;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

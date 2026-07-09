@@ -10,8 +10,10 @@ import {
   buildEuropePmcQuery,
   parseEuropePmcPapers
 } from './providers/europe-pmc.js';
+import { SemanticScholarResearchProvider } from './providers/semantic-scholar.js';
 import { planResearchQueries } from './query-planner.js';
 import type {
+  ResearchSourceKind,
   ResearchSearchProvider,
   ResearchSearchProviderResult,
   ResearchSearchRequest
@@ -54,6 +56,86 @@ describe('research search service', () => {
     assert.ok(plan.generatedQueries.some((query) => query.includes('PubMed Europe PMC')));
     assert.ok(plan.generatedQueries.some((query) => query.includes('meiotic entry retinoic acid')));
     assert.ok(!plan.generatedQueries.some((query) => query.includes('protein design')));
+  });
+
+  it('builds English source-specific query pack from Chinese research goals', () => {
+    const plan = planResearchQueries({
+      query: '实现一个用于蛋白结合物设计的扩散模型，找相关工作和开源代码',
+      maxQueries: 3
+    });
+
+    assert.equal(plan.language, 'zh');
+    assert.equal(plan.interpretedIntent.domain, 'biology');
+    assert.match(plan.normalizedGoal, /protein binder/i);
+    assert.match(plan.normalizedGoal, /diffusion model/i);
+    assert.ok(plan.coreConcepts.includes('protein'));
+    assert.ok(plan.methods.includes('diffusion model'));
+    assert.ok(plan.sourceQueries.semantic_scholar?.every((query) => !/[\u3400-\u9fff]/.test(query)));
+    assert.ok(plan.sourceQueries.biorxiv_web?.some((query) => /bioRxiv preprint/i.test(query)));
+    assert.ok(plan.sourceQueries.web?.some((query) => /GitHub|implementation/i.test(query)));
+  });
+
+  it('expands current RL acronyms for mixed Chinese-English research queries', () => {
+    const plan = planResearchQueries({
+      query: '帮我调研一下现在社区里面agentic RL大家选择GRPO还是GSPO？',
+      maxQueries: 3
+    });
+
+    assert.equal(plan.language, 'mixed');
+    assert.equal(plan.interpretedIntent.domain, 'ai4s');
+    assert.doesNotMatch(plan.normalizedGoal, /[\u3400-\u9fff]/);
+    assert.ok(plan.coreConcepts.includes('GSPO'));
+    assert.ok(plan.coreConcepts.includes('Group Sequence Policy Optimization'));
+    assert.ok(plan.generatedQueries.some((query) => /Group Relative Policy Optimization/i.test(query)));
+    assert.ok(plan.sourceQueries.arxiv?.some((query) => /Group Sequence Policy Optimization/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /Group Sequence Policy Optimization/i.test(query)));
+    assert.ok(plan.sourceQueries.web?.some((query) => /Group Sequence Policy Optimization/i.test(query)));
+  });
+
+  it('builds concise English seed queries for Chinese agentic RL algorithm surveys', () => {
+    const plan = planResearchQueries({
+      query: '现在的agentic RL社区内普遍采用的RL算法有哪些？各自的优势劣势以及适配的任务场景是什么？',
+      maxQueries: 5
+    });
+
+    assert.equal(plan.language, 'mixed');
+    assert.equal(plan.interpretedIntent.intent, 'latest');
+    assert.equal(plan.interpretedIntent.domain, 'ai4s');
+    assert.equal(plan.analysis.metadata.recency, 'recent');
+    assert.equal(plan.analysis.metadata.earliestYear, 2024);
+    assert.doesNotMatch(plan.normalizedGoal, /[\u3400-\u9fff]/);
+    assert.ok(plan.generatedQueries.some((query) => /LLM agents.*reinforcement learning algorithms|reinforcement learning.*LLM agents/i.test(query)));
+    assert.ok(plan.generatedQueries.some((query) => /GSPO|DAPO|Dr\.GRPO|Agent Lightning/i.test(query)));
+    assert.ok(plan.generatedQueries.some((query) => /2024 2025 2026|current practice/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /language model|LLM agents/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /GSPO/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /DAPO/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /Dr\.GRPO|VAPO|SAPO/i.test(query)));
+  });
+
+  it('corrects the common GSPO wrong expansion during query planning', () => {
+    const plan = planResearchQueries({
+      query: 'GSPO Group Superior Policy Optimization vs GRPO for agentic RL',
+      maxQueries: 3
+    });
+
+    assert.ok(plan.generatedQueries.some((query) => /Group Sequence Policy Optimization/i.test(query)));
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /GSPO "Group Sequence Policy Optimization"/i.test(query)));
+  });
+
+  it('analyzes scholarly metadata and relevance criteria from paper-finder style queries', () => {
+    const plan = planResearchQueries({
+      query: 'latest Nature papers by Andrew Ng on deep reinforcement learning since 2020',
+      maxQueries: 3
+    });
+
+    assert.equal(plan.analysis.metadata.recency, 'recent');
+    assert.equal(plan.analysis.metadata.earliestYear, 2020);
+    assert.deepEqual(plan.analysis.metadata.authors, ['Andrew Ng']);
+    assert.deepEqual(plan.analysis.metadata.venues, ['Nature']);
+    assert.match(plan.analysis.keywordQuery, /deep reinforcement learning/i);
+    assert.ok(plan.analysis.relevanceCriteria.required.length > 0);
+    assert.ok(plan.sourceQueries.semantic_scholar?.some((query) => /Nature Andrew Ng/i.test(query)));
   });
 
   it('builds arXiv queries with date filters', () => {
@@ -112,6 +194,7 @@ describe('research search service', () => {
     const service = createResearchSearchService({
       arxivEnabled: true,
       biorxivEnabled: false,
+      biorxivWebEnabled: false,
       europePmcEnabled: true,
       semanticScholarEnabled: true,
       semanticScholarApiKey: '',
@@ -190,4 +273,272 @@ describe('research search service', () => {
     assert.ok(result.citations.some((citation) => citation.source === 'arxiv,europe_pmc,semantic_scholar'));
     assert.ok(result.diagnostics.some((diagnostic) => diagnostic.id === 'tavily' && diagnostic.available));
   });
+
+  it('routes source-specific queries and searches providers concurrently', async () => {
+    const seenQueries = new Map<string, string[]>();
+    const delayedProvider = (id: ResearchSearchProvider['id']) => new FakeProvider(id, (request) => {
+      const queries = seenQueries.get(id) ?? [];
+      queries.push(request.query);
+      seenQueries.set(id, queries);
+      return {
+        papers: [{
+          title: `${id} paper`,
+          authors: ['A. Author'],
+          year: 2026,
+          abstract: request.query,
+          url: `https://example.test/${id}`,
+          source: providerPaperSource(id)
+        }],
+        webResults: id === 'tavily' || id === 'biorxiv_web'
+          ? [{
+              title: `${id} web`,
+              url: `https://example.test/${id}/web`,
+              snippet: request.query,
+              source: id === 'biorxiv_web' ? 'biorxiv_web' : 'tavily',
+              rank: 1
+            }]
+          : [],
+        diagnostics: [{ id, enabled: true, available: true, resultCount: 1 }]
+      };
+    });
+    const service = createResearchSearchService({
+      arxivEnabled: true,
+      biorxivEnabled: false,
+      biorxivWebEnabled: true,
+      europePmcEnabled: false,
+      semanticScholarEnabled: true,
+      semanticScholarApiKey: '',
+      tavilyEnabled: true,
+      tavilyApiKey: 'key',
+      cnsEnabled: false,
+      cnsDomains: [],
+      maxResults: 6,
+      timeoutMs: 1000
+    }, {
+      providers: {
+        arxiv: delayedProvider('arxiv'),
+        biorxiv_web: delayedProvider('biorxiv_web'),
+        semantic_scholar: delayedProvider('semantic_scholar'),
+        tavily: delayedProvider('tavily')
+      }
+    });
+
+    const result = await service.search({
+      query: '实现一个用于蛋白结合物设计的扩散模型，找相关工作和开源代码',
+      sources: ['arxiv', 'biorxiv_web', 'semantic_scholar', 'web'],
+      maxResults: 6
+    });
+
+    assert.equal(result.searchPlan.language, 'zh');
+    assert.ok(seenQueries.get('arxiv')?.every((query) => !/[\u3400-\u9fff]/.test(query)));
+    assert.ok(seenQueries.get('biorxiv_web')?.some((query) => /bioRxiv/i.test(query)));
+    assert.ok(seenQueries.get('tavily')?.some((query) => /GitHub|implementation/i.test(query)));
+    assert.notDeepEqual(seenQueries.get('arxiv'), seenQueries.get('tavily'));
+    assert.ok(result.webResults.some((result) => result.source === 'biorxiv_web'));
+  });
+
+  it('uses analyzed recent time ranges when caller does not pass sinceYear', async () => {
+    const seenSinceYears: Array<number | undefined> = [];
+    const service = createResearchSearchService({
+      arxivEnabled: true,
+      biorxivEnabled: false,
+      biorxivWebEnabled: false,
+      europePmcEnabled: false,
+      semanticScholarEnabled: false,
+      semanticScholarApiKey: '',
+      tavilyEnabled: false,
+      tavilyApiKey: '',
+      cnsEnabled: false,
+      cnsDomains: [],
+      maxResults: 4,
+      timeoutMs: 1000
+    }, {
+      providers: {
+        arxiv: new FakeProvider('arxiv', (request) => {
+          seenSinceYears.push(request.sinceYear);
+          return {
+            papers: [],
+            webResults: [],
+            diagnostics: [{ id: 'arxiv', enabled: true, available: true, resultCount: 0 }]
+          };
+        })
+      }
+    });
+
+    const result = await service.search({
+      query: 'latest papers on single-cell foundation models',
+      sources: ['arxiv'],
+      maxResults: 4
+    });
+
+    assert.ok(seenSinceYears.every((year) => year === 2024));
+    assert.equal(result.searchPlan.metadata.earliestYear, 2024);
+    assert.equal(result.searchPlan.metadata.latestYear, 2026);
+  });
+
+  it('treats current adoption surveys as recent searches and ranks fresher papers first', async () => {
+    const seenSinceYears: Array<number | undefined> = [];
+    const service = createResearchSearchService({
+      arxivEnabled: false,
+      biorxivEnabled: false,
+      biorxivWebEnabled: false,
+      europePmcEnabled: false,
+      semanticScholarEnabled: true,
+      semanticScholarApiKey: '',
+      tavilyEnabled: false,
+      tavilyApiKey: '',
+      cnsEnabled: false,
+      cnsDomains: [],
+      maxResults: 4,
+      timeoutMs: 1000
+    }, {
+      providers: {
+        semantic_scholar: new FakeProvider('semantic_scholar', (request) => {
+          seenSinceYears.push(request.sinceYear);
+          return {
+            papers: [
+              {
+                title: 'Agentic RL Algorithms for Language Model Agents in 2026',
+                authors: ['A. Current'],
+                year: 2026,
+                citationCount: 1,
+                abstract: 'GSPO DAPO Dr.GRPO VAPO comparison for LLM agents and current community adoption.',
+                url: 'https://example.test/current',
+                source: ['semantic_scholar']
+              },
+              {
+                title: 'Classic Reinforcement Learning from Human Feedback for Language Models',
+                authors: ['A. Classic'],
+                year: 2022,
+                citationCount: 5000,
+                abstract: 'PPO RLHF language models.',
+                url: 'https://example.test/classic',
+                source: ['semantic_scholar']
+              }
+            ],
+            webResults: [],
+            diagnostics: [{ id: 'semantic_scholar', enabled: true, available: true, resultCount: 2 }]
+          };
+        })
+      }
+    });
+
+    const result = await service.search({
+      query: '现在的agentic RL社区内普遍采用的RL算法有哪些？各自的优势劣势以及适配的任务场景是什么？',
+      sources: ['semantic_scholar'],
+      maxResults: 4
+    });
+
+    assert.equal(result.interpretedIntent.intent, 'latest');
+    assert.ok(seenSinceYears.every((year) => year === 2024));
+    assert.match(result.generatedQueries.join(' '), /2024 2025 2026|current practice/i);
+    assert.equal(result.papers[0]?.year, 2026);
+  });
+
+  it('retries Semantic Scholar HTTP 429 responses before degrading', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = async (input) => {
+      calls.push(String(input));
+      if (calls.length === 1) {
+        return jsonResponse({ message: 'rate limited' }, 429);
+      }
+      return jsonResponse({
+        data: [{
+          title: 'Perturbation Prediction with Single-Cell Foundation Models',
+          authors: [{ name: 'A. Biologist' }],
+          year: 2026,
+          citationCount: 7,
+          externalIds: { DOI: '10.1101/example' },
+          url: 'https://www.semanticscholar.org/paper/example',
+          tldr: { text: 'Benchmarks single-cell perturbation prediction.' }
+        }]
+      });
+    };
+
+    try {
+      const provider = new SemanticScholarResearchProvider('s2-test', {
+        minIntervalMs: 0,
+        maxRetries: 1,
+        retryBaseDelayMs: 1
+      });
+      const result = await provider.search(researchRequest('single cell foundation model'));
+
+      assert.equal(calls.length, 2);
+      assert.equal(result.diagnostics?.[0]?.available, true);
+      assert.equal(result.papers.length, 1);
+      assert.equal(result.papers[0]?.source[0], 'semantic_scholar');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('serializes concurrent Semantic Scholar calls through a global rate limit', async () => {
+    const originalFetch = globalThis.fetch;
+    const delayCalls: number[] = [];
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      return jsonResponse({
+        data: [{
+          title: `Semantic Scholar Result ${fetchCount}`,
+          authors: [{ name: 'A. Author' }],
+          year: 2026,
+          citationCount: 1,
+          externalIds: {},
+          url: `https://www.semanticscholar.org/paper/${fetchCount}`
+        }]
+      });
+    };
+
+    try {
+      const provider = new SemanticScholarResearchProvider('s2-test', {
+        minIntervalMs: 25,
+        maxRetries: 0,
+        delayImpl: async (ms) => {
+          delayCalls.push(ms);
+        }
+      });
+
+      const [first, second] = await Promise.all([
+        provider.search(researchRequest('protein binder design')),
+        provider.search(researchRequest('crystal diffusion model'))
+      ]);
+
+      assert.equal(fetchCount, 2);
+      assert.equal(first.diagnostics?.[0]?.available, true);
+      assert.equal(second.diagnostics?.[0]?.available, true);
+      assert.equal(delayCalls.some((ms) => ms > 0), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
+
+function researchRequest(query: string): ResearchSearchRequest {
+  return {
+    query,
+    intent: 'latest',
+    domain: 'biology',
+    maxResults: 3,
+    timeoutMs: 1000,
+    signal: new AbortController().signal
+  };
+}
+
+function providerPaperSource(id: ResearchSearchProvider['id']): ResearchSourceKind[] {
+  if (id === 'tavily') return ['web'];
+  if (id === 'cns') return ['cns'];
+  if (id === 'biorxiv_web') return ['biorxiv_web'];
+  if (id === 'semantic_scholar') return ['semantic_scholar'];
+  if (id === 'europe_pmc') return ['europe_pmc'];
+  if (id === 'biorxiv') return ['biorxiv'];
+  return ['arxiv'];
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  });
+}

@@ -134,6 +134,32 @@ test('runtime preserves an explicit empty child tool allow-list', async () => {
   })
 })
 
+test('runtime child lookup during queued event does not mark the live child stale', async () => {
+  const store = new InMemoryMultiAgentStore()
+  const observedStatuses: string[] = []
+  let runtime!: MultiAgentRuntime
+  runtime = new MultiAgentRuntime({
+    store,
+    idGenerator: () => 'child-live-queued',
+    executor: async () => ({ summary: 'Done' }),
+    events: {
+      onChildEvent: async (event) => {
+        if (event.status !== 'queued') return
+        const record = await runtime.child(event.parentThreadId, event.childId)
+        if (record) observedStatuses.push(record.status)
+      }
+    }
+  })
+
+  await runtime.runChild({
+    parentThreadId: 'thread-1',
+    parentTurnId: 'turn-1',
+    prompt: 'Observe queued status'
+  })
+
+  assert.deepEqual(observedStatuses, ['queued'])
+})
+
 test('runtime drops runtime-only usage fields returned by child executors', async () => {
   const runtime = new MultiAgentRuntime({
     store: new InMemoryMultiAgentStore(),

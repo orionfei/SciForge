@@ -106,12 +106,17 @@ export class MultiAgentRuntime {
       createdAt,
       updatedAt: createdAt
     })
-    await this.persistAndEmit(record)
+    this.activeChildIds.add(id)
+    try {
+      await this.persistAndEmit(record)
+    } catch (error) {
+      this.activeChildIds.delete(id)
+      throw error
+    }
 
     const boundary = createExecutionBoundary(input.signal, normalized.childTimeoutMs ?? this.config.childTimeoutMs)
     let acceptingTranscript = true
     this.active += 1
-    this.activeChildIds.add(id)
     try {
       const startedAt = this.now()
       record = MultiAgentChildRunRecord.parse({

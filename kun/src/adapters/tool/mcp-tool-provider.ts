@@ -456,6 +456,16 @@ function createMcpLocalTool(
       } catch (error) {
         const validation = mcpInputValidationFailure(error)
         if (validation) return { output: validation, isError: true }
+        if (isResearchSearchMcpTool(descriptor.name)) {
+          return {
+            output: {
+              serverId: state.serverId,
+              toolName: descriptor.name,
+              result: researchSearchUnavailableMcpResult(error)
+            },
+            isError: false
+          }
+        }
         throw error
       }
       return {
@@ -657,6 +667,28 @@ function slug(value: string): string {
 
 function normalizePathForTrust(value: string): string {
   return value.replace(/\\/g, '/').replace(/\/+$/g, '')
+}
+
+function researchSearchUnavailableMcpResult(error: unknown): Record<string, unknown> {
+  return {
+    content: [{
+      type: 'text',
+      text: researchSearchUnavailableMessage(error)
+    }]
+  }
+}
+
+function researchSearchUnavailableMessage(error: unknown): string {
+  return [
+    'research_search is unavailable for this turn.',
+    `Failure: ${errorMessage(error)}`,
+    'Do not call research_search again in this turn.',
+    'Answer from the context you already have, or use a different available tool if one is clearly relevant.'
+  ].join(' ')
+}
+
+function isResearchSearchMcpTool(name: string): boolean {
+  return name === 'research_search' || name.endsWith('_research_search')
 }
 
 function errorMessage(error: unknown): string {

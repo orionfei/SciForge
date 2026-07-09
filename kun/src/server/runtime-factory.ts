@@ -10,7 +10,7 @@ import { InMemoryEventBus } from '../adapters/in-memory-event-bus.js'
 import { FileSessionStore, FileThreadStore } from '../adapters/file/index.js'
 import { HybridSessionStore, HybridThreadStore } from '../adapters/hybrid/index.js'
 import { ModelRouterModelClient } from '../adapters/model/model-router-model-client.js'
-import { CapabilityRegistry } from '../adapters/tool/capability-registry.js'
+import { CapabilityRegistry, type CapabilityToolProvider } from '../adapters/tool/capability-registry.js'
 import { buildGoalLocalTools } from '../adapters/tool/goal-tools.js'
 import { buildTodoLocalTools } from '../adapters/tool/todo-tools.js'
 import { LocalToolHost, buildDefaultLocalTools } from '../adapters/tool/local-tool-host.js'
@@ -68,6 +68,13 @@ import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
 const GUI_RESEARCH_MCP_SERVER_NAME = 'gui_research'
 const DEFAULT_RESEARCH_SOURCES = ['arxiv', 'biorxiv', 'europe_pmc', 'semantic_scholar'] as const
 const DEFAULT_MODEL_ROUTER_BASE_URL = 'http://127.0.0.1:3892/v1'
+const DELEGATED_RESEARCH_MCP_SEARCH_PROVIDER_ID = 'mcp:search'
+const DELEGATED_RESEARCH_TOOL_NAMES = new Set([
+  'research_search',
+  'research_search_diagnostics',
+  'mcp_gui_research_research_search',
+  'mcp_gui_research_research_search_diagnostics'
+])
 
 export type LocalRuntimeServeOptions = {
   host: string
@@ -190,7 +197,7 @@ export async function createLocalRuntimeServeRuntime(
         nowIso
       })
     : undefined
-  const baseToolProviders = [
+  const childBaseToolProviders = [
     {
       id: 'builtin',
       kind: 'built-in' as const,
@@ -208,7 +215,7 @@ export async function createLocalRuntimeServeRuntime(
     provider.available &&
     provider.tools.some((tool) => tool.name === 'computer_use')
   )
-  const childRegistry = new CapabilityRegistry(baseToolProviders)
+  const childRegistry = new CapabilityRegistry(childBaseToolProviders)
   const childToolHost = new LocalToolHost({ registry: childRegistry, readTracker: true })
   const delegationRuntime = capabilityConfig.subagents.enabled
     ? new MultiAgentRuntime({
@@ -278,8 +285,12 @@ export async function createLocalRuntimeServeRuntime(
       available: Boolean(delegationRuntime)
     }
   })
+  const parentBaseToolProviders = parentToolProvidersForDelegatedResearch(
+    childBaseToolProviders,
+    Boolean(delegationRuntime)
+  )
   const registry = new CapabilityRegistry([
-    ...baseToolProviders,
+    ...parentBaseToolProviders,
     {
       id: 'goal',
       kind: 'gui' as const,
@@ -400,6 +411,23 @@ export async function createLocalRuntimeServeRuntime(
       }
     }
   }
+}
+
+export function parentToolProvidersForDelegatedResearch(
+  providers: readonly CapabilityToolProvider[],
+  delegationEnabled: boolean
+): CapabilityToolProvider[] {
+  if (!delegationEnabled) return [...providers]
+  return providers.flatMap((provider) => {
+    if (provider.id === `mcp:${GUI_RESEARCH_MCP_SERVER_NAME}`) return []
+    if (provider.id === DELEGATED_RESEARCH_MCP_SEARCH_PROVIDER_ID) return []
+    const tools = provider.tools.filter((tool) => !isDelegatedResearchToolName(tool.name))
+    return tools.length ? [{ ...provider, tools }] : []
+  })
+}
+
+function isDelegatedResearchToolName(name: string): boolean {
+  return DELEGATED_RESEARCH_TOOL_NAMES.has(name) || name.endsWith('_research_search')
 }
 
 export function resolveModelRouterRuntimeEndpoint(options: LocalRuntimeServeOptions): {

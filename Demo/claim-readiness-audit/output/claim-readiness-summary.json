@@ -1,0 +1,37 @@
+{
+  "verdict": "not_ready",
+  "parentThreadId": "claim-readiness-demo",
+  "parentTurnId": "turn-1783132240141",
+  "childRuns": [
+    {
+      "id": "child_mr5qwa33_777y3n",
+      "label": "Result Analyst",
+      "status": "completed",
+      "summary": "Verdict: weak_support\nKey finding: Mean accuracy lift is 1.9% and mean macro-F1 lift is 1.2%, but no statistical test or confidence interval is present.\nEvidence: Baseline-A mean accuracy 84.3% | SciForgeNet mean accuracy 86.2% | 3 seeds available\nRecommendation: Add confidence intervals and a paired or bootstrap significance test before using \"significantly outperforms\"."
+    },
+    {
+      "id": "child_mr5qwa36_37m9ks",
+      "label": "Baseline Critic",
+      "status": "completed",
+      "summary": "Verdict: not_fair_yet\nKey finding: The method and baseline use different preprocessing, image size, and augmentation settings.\nEvidence: Baseline preprocessing standard_v1, image size 224 | Method preprocessing augmented_v2, image size 256 | Method augmentation random_crop,color_jitter\nRecommendation: Re-run Baseline-A under the same preprocessing and image-size policy, or narrow the claim to this exact setup."
+    },
+    {
+      "id": "child_mr5qwa36_934rh3",
+      "label": "Reproducibility Auditor",
+      "status": "completed",
+      "summary": "Verdict: partially_reproducible\nKey finding: Seeds and logs exist, but the environment is under-specified.\nEvidence: Recorded seeds: 11, 22, 33 | CUDA: not recorded | Requirements lock: missing\nRecommendation: Add a locked environment file and record CUDA/library versions before treating this as manuscript-grade evidence."
+    },
+    {
+      "id": "child_mr5qwa36_i8nd2s",
+      "label": "Data Risk Auditor",
+      "status": "completed",
+      "summary": "Verdict: high_risk\nKey finding: The dataset summary reports train-test duplicate patient IDs and a large positive-rate shift.\nEvidence: Train-test duplicate patient IDs: 7 | Train positive rate 18.0% | Test positive rate 9.0%\nRecommendation: Remove overlapping patients, regenerate splits, and report class-balanced metrics after the fix."
+    },
+    {
+      "id": "child_mr5qwa36_q724tk",
+      "label": "Claim Critic",
+      "status": "completed",
+      "summary": "Verdict: not_ready\nKey finding: The current evidence supports \"higher observed accuracy in this run package\", not \"significantly outperforms\".\nEvidence: Observed accuracy lift 1.9% | No significance test | Fairness and data-risk agents found blocking issues\nRecommendation: Downgrade the claim or complete the blocking follow-up experiments before writing it into the paper."
+    }
+  ]
+}

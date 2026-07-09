@@ -14,6 +14,16 @@ async function tempRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'sciforge-app-data-store-'))
 }
 
+async function symlinkOrSkip(target: string, path: string): Promise<boolean> {
+  try {
+    await symlink(target, path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') return false
+    throw error
+  }
+}
+
 describe('app-data-store', () => {
   it('writes JSON through a temp file and resolves the final path inside app data', async () => {
     const root = await tempRoot()
@@ -28,6 +38,19 @@ describe('app-data-store', () => {
     expect((await lstat(target.path)).isSymbolicLink()).toBe(false)
   })
 
+  it('keeps concurrent atomic JSON writes valid when they target the same file', async () => {
+    const root = await tempRoot()
+
+    await Promise.all(Array.from({ length: 30 }, (_, index) => (
+      atomicWriteAppDataJson(root, ['runtime-goals', 'goals.json'], { index })
+    )))
+
+    const stored = JSON.parse(await readAppDataStoreText(root, ['runtime-goals', 'goals.json'])) as { index: number }
+    expect(Number.isInteger(stored.index)).toBe(true)
+    expect(stored.index).toBeGreaterThanOrEqual(0)
+    expect(stored.index).toBeLessThan(30)
+  })
+
   it('rejects unsafe path segments', async () => {
     const root = await tempRoot()
 
@@ -40,7 +63,7 @@ describe('app-data-store', () => {
   it('rejects symlinked parents under app data', async () => {
     const root = await tempRoot()
     const outside = await tempRoot()
-    await symlink(outside, join(root, 'runtime-goals'))
+    if (!await symlinkOrSkip(outside, join(root, 'runtime-goals'))) return
 
     await expect(atomicWriteAppDataJson(root, ['runtime-goals', 'goals.json'], { goals: [] }))
       .rejects.toThrow(/must not cross a symlink/)
@@ -52,7 +75,7 @@ describe('app-data-store', () => {
     const outsideFile = join(outside, 'goals.json')
     await writeFile(outsideFile, 'outside', 'utf8')
     await atomicWriteAppDataJson(root, ['runtime-goals', 'seed.json'], {})
-    await symlink(outsideFile, join(root, 'runtime-goals', 'goals.json'))
+    if (!await symlinkOrSkip(outsideFile, join(root, 'runtime-goals', 'goals.json'))) return
 
     await expect(atomicWriteAppDataJson(root, ['runtime-goals', 'goals.json'], { goals: [] }))
       .rejects.toThrow(/not a symlink/)
@@ -85,7 +108,7 @@ describe('app-data-store', () => {
   it('rejects JSONL append through a symlinked parent directory', async () => {
     const root = await tempRoot()
     const outside = await tempRoot()
-    await symlink(outside, join(root, 'events'))
+    if (!await symlinkOrSkip(outside, join(root, 'events'))) return
 
     await expect(appendAppDataStoreText(root, ['events', 'thread.jsonl'], '{}\n'))
       .rejects.toThrow(/must not cross a symlink/)
@@ -97,7 +120,7 @@ describe('app-data-store', () => {
     const outsideFile = join(outside, 'thread.jsonl')
     await mkdir(join(root, 'events'))
     await writeFile(outsideFile, 'outside', 'utf8')
-    await symlink(outsideFile, join(root, 'events', 'thread.jsonl'))
+    if (!await symlinkOrSkip(outsideFile, join(root, 'events', 'thread.jsonl'))) return
 
     await expect(appendAppDataStoreText(root, ['events', 'thread.jsonl'], '{}\n'))
       .rejects.toThrow(/not a symlink|regular file/)
